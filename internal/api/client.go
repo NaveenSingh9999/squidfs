@@ -7,11 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
-	"path"
 	"sync"
 	"time"
 )
@@ -123,62 +121,118 @@ func (c *Client) headers() map[string]string {
 	}
 }
 
-func (c *Client) UploadFile(filePath string, data []byte, mimeType string, encryptionKey string) (*UploadResponse, error) {
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
+type UploadInitResponse struct {
+	Success       bool              `json:"success"`
+	UploadID      string            `json:"upload_id"`
+	FileID        string            `json:"file_id"`
+	EncryptionKey string            `json:"encryption_key"`
+	URLs          []UploadURL       `json:"urls"`
+	ChunkSize     int               `json:"chunk_size"`
+	TotalChunks   int               `json:"total_chunks"`
+	BucketAssigns map[string]string `json:"bucket_assignments"`
+}
 
-	part, err := writer.CreateFormFile("file", path.Base(filePath))
+type UploadURL struct {
+	Index     int    `json:"index"`
+	Path      string `json:"path"`
+	UploadURL string `json:"upload_url"`
+	Bucket    string `json:"bucket"`
+	ClusterID string `json:"cluster_id"`
+}
+
+func (c *Client) UploadFile(name string, data []byte, mimeType string, folderID string) (*UploadResponse, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty data")
+	}
+
+	initBody, _ := json.Marshal(map[string]interface{}{
+		"name":      name,
+		"type":      mimeType,
+		"size":      len(data),
+		"folder_id": folderID,
+	})
+	req, err := http.NewRequest("POST", c.apiURL("/upload"), bytes.NewReader(initBody))
 	if err != nil {
-		return nil, fmt.Errorf("create form file: %w", err)
+		return nil, fmt.Errorf("create init request: %w", err)
 	}
-
-	if _, err := part.Write(data); err != nil {
-		return nil, fmt.Errorf("write file data: %w", err)
-	}
-
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("close multipart writer: %w", err)
-	}
-
-	queryParams := ""
-	if encryptionKey != "" {
-		queryParams = "?encryption_key=" + encryptionKey
-	}
-
-	req, err := http.NewRequest("POST", c.apiURL("/files"+queryParams), &body)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
 	for k, v := range c.headers() {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("upload request: %w", err)
+		return nil, fmt.Errorf("init upload: %w", err)
 	}
 	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("init upload failed (%d): %s", resp.StatusCode, string(respBody))
+	}
+	var initResp UploadInitResponse
+	if err := json.Unmarshal(respBody, &initResp); err != nil {
+		return nil, fmt.Errorf("decode init response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		var errResp ErrorResponse
-		if json.Unmarshal(respBody, &errResp) == nil {
-			return nil, fmt.Errorf("upload failed (%d): %s", resp.StatusCode, errResp.Error)
+	chunkSize := initResp.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = 512 * 1024
+	}
+	for i := 0; i < initResp.TotalChunks; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(data) {
+			end = len(data)
 		}
-		return nil, fmt.Errorf("upload failed (%d): %s", resp.StatusCode, string(respBody))
+		chunk := data[start:end]
+
+		if i >= len(initResp.URLs) {
+			return nil, fmt.Errorf("no upload URL for chunk %d", i)
+		}
+		putReq, err := http.NewRequest("PUT", initResp.URLs[i].UploadURL, bytes.NewReader(chunk))
+		if err != nil {
+			return nil, fmt.Errorf("create chunk %d request: %w", i, err)
+		}
+		putReq.Header.Set("Content-Type", "application/octet-stream")
+		putReq.Header.Set("Content-Length", fmt.Sprintf("%d", len(chunk)))
+
+		putResp, err := c.HTTPClient.Do(putReq)
+		if err != nil {
+			return nil, fmt.Errorf("upload chunk %d: %w", i, err)
+		}
+		putResp.Body.Close()
+		if putResp.StatusCode != http.StatusOK && putResp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(putResp.Body)
+			return nil, fmt.Errorf("chunk %d upload failed (%d): %s", i, putResp.StatusCode, string(body))
+		}
+	}
+
+	completeBody, _ := json.Marshal(map[string]interface{}{
+		"upload_id": initResp.UploadID,
+	})
+	compReq, err := http.NewRequest("POST", c.apiURL("/upload/complete"), bytes.NewReader(completeBody))
+	if err != nil {
+		return nil, fmt.Errorf("create complete request: %w", err)
+	}
+	for k, v := range c.headers() {
+		compReq.Header.Set(k, v)
+	}
+	compReq.Header.Set("Content-Type", "application/json")
+
+	compResp, err := c.HTTPClient.Do(compReq)
+	if err != nil {
+		return nil, fmt.Errorf("complete upload: %w", err)
+	}
+	defer compResp.Body.Close()
+	compBody, _ := io.ReadAll(compResp.Body)
+	if compResp.StatusCode != http.StatusOK && compResp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("complete upload failed (%d): %s", compResp.StatusCode, string(compBody))
 	}
 
 	var uploadResp UploadResponse
-	if err := json.Unmarshal(respBody, &uploadResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	if err := json.Unmarshal(compBody, &uploadResp); err != nil {
+		return &UploadResponse{Success: true, File: FileMetadata{ID: initResp.FileID, Name: name}}, nil
 	}
-
 	return &uploadResp, nil
 }
 
