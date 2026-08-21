@@ -25,27 +25,40 @@ type FileMetadata struct {
 	Type          string    `json:"type"`
 	Size          int64     `json:"size"`
 	StoragePath   string    `json:"storage_path"`
+	MimeType      string    `json:"mime_type"`
 	Encrypted     bool      `json:"encrypted"`
 	EncryptionKey string    `json:"encryption_key,omitempty"`
-	GitHubRepo    string    `json:"github_repo,omitempty"`
 	ParentFolder  string    `json:"parent_folder,omitempty"`
 	WorkspaceID   string    `json:"workspace_id,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
+type FolderMetadata struct {
+	ID           string    `json:"id"`
+	UserID       string    `json:"user_id"`
+	Name         string    `json:"name"`
+	Path         string    `json:"path"`
+	ParentFolder string    `json:"parent_folder,omitempty"`
+	WorkspaceID  string    `json:"workspace_id,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
 type UploadResponse struct {
-	Success   bool         `json:"success"`
-	File      FileMetadata `json:"file"`
-	Message   string       `json:"message"`
-	Encryption struct {
-		Mode string `json:"mode"`
-	} `json:"encryption"`
+	Success bool         `json:"success"`
+	File    FileMetadata `json:"file"`
+	Message string       `json:"message"`
 }
 
 type ListFilesResponse struct {
-	Success bool           `json:"success"`
-	Files   []FileMetadata `json:"files"`
+	Success      bool             `json:"success"`
+	Files        []FileMetadata   `json:"files"`
+	Folders      []FolderMetadata `json:"folders"`
+	TotalFiles   int              `json:"total_files"`
+	TotalFolders int              `json:"total_folders"`
+	Page         int              `json:"page"`
+	PerPage      int              `json:"per_page"`
+	TotalPages   int              `json:"total_pages"`
 }
 
 type ErrorResponse struct {
@@ -68,14 +81,15 @@ func NewClient(baseURL, apiKey string) *Client {
 	}
 }
 
-func (c *Client) apiURL(functionName string) string {
-	return fmt.Sprintf("%s/functions/v1/%s", c.BaseURL, functionName)
+func (c *Client) apiURL(subpath string) string {
+	return fmt.Sprintf("%s/functions/v1/cloudbliss-api%s", c.BaseURL, subpath)
 }
 
 func (c *Client) headers() map[string]string {
 	return map[string]string{
-		"apikey":     c.APIKey,
-		"Authorization": fmt.Sprintf("Bearer %s", c.APIKey),
+		"apikey":           c.APIKey,
+		"Authorization":    fmt.Sprintf("Bearer %s", c.APIKey),
+		"x-squidcloud-key": c.APIKey,
 	}
 }
 
@@ -92,17 +106,16 @@ func (c *Client) UploadFile(filePath string, data []byte, mimeType string, encry
 		return nil, fmt.Errorf("write file data: %w", err)
 	}
 
-	if encryptionKey != "" {
-		if err := writer.WriteField("encryption_key", encryptionKey); err != nil {
-			return nil, fmt.Errorf("write encryption key: %w", err)
-		}
-	}
-
 	if err := writer.Close(); err != nil {
 		return nil, fmt.Errorf("close multipart writer: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.apiURL("api-file-upload"), &body)
+	queryParams := ""
+	if encryptionKey != "" {
+		queryParams = "?encryption_key=" + encryptionKey
+	}
+
+	req, err := http.NewRequest("POST", c.apiURL("/files"+queryParams), &body)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -123,7 +136,7 @@ func (c *Client) UploadFile(filePath string, data []byte, mimeType string, encry
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusCreated {
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		var errResp ErrorResponse
 		if json.Unmarshal(respBody, &errResp) == nil {
 			return nil, fmt.Errorf("upload failed (%d): %s", resp.StatusCode, errResp.Error)
@@ -140,7 +153,7 @@ func (c *Client) UploadFile(filePath string, data []byte, mimeType string, encry
 }
 
 func (c *Client) GetFile(fileID string) (*FileMetadata, error) {
-	req, err := http.NewRequest("POST", c.apiURL("secure-file-metadata"), nil)
+	req, err := http.NewRequest("GET", c.apiURL("/files/"+fileID+"/metadata"), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -148,15 +161,6 @@ func (c *Client) GetFile(fileID string) (*FileMetadata, error) {
 	for k, v := range c.headers() {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	body := map[string]interface{}{
-		"action": "get",
-		"fileId": fileID,
-	}
-	bodyBytes, _ := json.Marshal(body)
-	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	req.ContentLength = int64(len(bodyBytes))
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -189,7 +193,12 @@ func (c *Client) GetFile(fileID string) (*FileMetadata, error) {
 }
 
 func (c *Client) ListFiles(folderID string) (*ListFilesResponse, error) {
-	req, err := http.NewRequest("POST", c.apiURL("secure-file-metadata"), nil)
+	reqURL := c.apiURL("/files?per_page=100")
+	if folderID != "" && folderID != "root" {
+		reqURL += "&folder_id=" + folderID
+	}
+
+	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -197,15 +206,6 @@ func (c *Client) ListFiles(folderID string) (*ListFilesResponse, error) {
 	for k, v := range c.headers() {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	body := map[string]interface{}{
-		"action":     "list",
-		"parentFolder": folderID,
-	}
-	bodyBytes, _ := json.Marshal(body)
-	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	req.ContentLength = int64(len(bodyBytes))
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -226,19 +226,58 @@ func (c *Client) ListFiles(folderID string) (*ListFilesResponse, error) {
 		return nil, fmt.Errorf("list files failed (%d): %s", resp.StatusCode, string(respBody))
 	}
 
-	var result struct {
-		Success bool           `json:"success"`
-		Files   []FileMetadata `json:"files"`
-	}
+	var result ListFilesResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
-	return &ListFilesResponse{Success: result.Success, Files: result.Files}, nil
+	return &result, nil
+}
+
+func (c *Client) ListFilesByName(folderName string) (*ListFilesResponse, error) {
+	reqURL := c.apiURL("/files?per_page=100")
+	if folderName != "" {
+		reqURL += "&folder_id=" + folderName
+	}
+
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	for k, v := range c.headers() {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list files request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp ErrorResponse
+		if json.Unmarshal(respBody, &errResp) == nil {
+			return nil, fmt.Errorf("list files failed (%d): %s", resp.StatusCode, errResp.Error)
+		}
+		return nil, fmt.Errorf("list files failed (%d): %s", resp.StatusCode, string(respBody))
+	}
+
+	var result ListFilesResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	return &result, nil
 }
 
 func (c *Client) DeleteFile(fileID string) error {
-	req, err := http.NewRequest("POST", c.apiURL("api-file-delete"), nil)
+	req, err := http.NewRequest("DELETE", c.apiURL("/files/"+fileID), nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -246,8 +285,6 @@ func (c *Client) DeleteFile(fileID string) error {
 	for k, v := range c.headers() {
 		req.Header.Set(k, v)
 	}
-
-	req.URL.Path = path.Join(req.URL.Path, fileID)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -272,7 +309,7 @@ func (c *Client) DeleteFile(fileID string) error {
 }
 
 func (c *Client) DownloadFile(fileID string) ([]byte, error) {
-	req, err := http.NewRequest("POST", c.apiURL("secure-file-metadata"), nil)
+	req, err := http.NewRequest("GET", c.apiURL("/files/"+fileID+"/download"), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -280,15 +317,6 @@ func (c *Client) DownloadFile(fileID string) ([]byte, error) {
 	for k, v := range c.headers() {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	body := map[string]interface{}{
-		"action": "download",
-		"fileId": fileID,
-	}
-	bodyBytes, _ := json.Marshal(body)
-	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	req.ContentLength = int64(len(bodyBytes))
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -304,8 +332,17 @@ func (c *Client) DownloadFile(fileID string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-func (c *Client) CreateFolder(name, parentID string) (*FileMetadata, error) {
-	req, err := http.NewRequest("POST", c.apiURL("secure-file-metadata"), nil)
+func (c *Client) CreateFolder(name, parentFolder string) (*FolderMetadata, error) {
+	body := map[string]interface{}{
+		"name": name,
+	}
+	if parentFolder != "" && parentFolder != "root" {
+		body["parent_folder"] = parentFolder
+	}
+
+	bodyBytes, _ := json.Marshal(body)
+
+	req, err := http.NewRequest("POST", c.apiURL("/folders"), bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -314,18 +351,6 @@ func (c *Client) CreateFolder(name, parentID string) (*FileMetadata, error) {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Content-Type", "application/json")
-
-	body := map[string]interface{}{
-		"name":         name,
-		"type":         "folder",
-		"size":         0,
-		"storagePath":  "folder",
-		"encrypted":    false,
-		"parentFolder": parentID,
-	}
-	bodyBytes, _ := json.Marshal(body)
-	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	req.ContentLength = int64(len(bodyBytes))
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -338,7 +363,7 @@ func (c *Client) CreateFolder(name, parentID string) (*FileMetadata, error) {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		var errResp ErrorResponse
 		if json.Unmarshal(respBody, &errResp) == nil {
 			return nil, fmt.Errorf("create folder failed (%d): %s", resp.StatusCode, errResp.Error)
@@ -347,18 +372,29 @@ func (c *Client) CreateFolder(name, parentID string) (*FileMetadata, error) {
 	}
 
 	var result struct {
-		Success bool         `json:"success"`
-		File    FileMetadata `json:"file"`
+		Success       bool   `json:"success"`
+		ID            string `json:"id"`
+		Name          string `json:"name"`
+		ParentFolder  string `json:"parent_folder"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
-	return &result.File, nil
+	return &FolderMetadata{
+		ID:           result.ID,
+		Name:         result.Name,
+		ParentFolder: result.ParentFolder,
+	}, nil
 }
 
 func (c *Client) RenameFile(fileID, newName string) error {
-	req, err := http.NewRequest("POST", c.apiURL("secure-file-metadata"), nil)
+	body := map[string]interface{}{
+		"name": newName,
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req, err := http.NewRequest("PUT", c.apiURL("/files/"+fileID+"/rename"), bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -367,15 +403,6 @@ func (c *Client) RenameFile(fileID, newName string) error {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Content-Type", "application/json")
-
-	body := map[string]interface{}{
-		"action": "rename",
-		"fileId": fileID,
-		"name":   newName,
-	}
-	bodyBytes, _ := json.Marshal(body)
-	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	req.ContentLength = int64(len(bodyBytes))
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -394,6 +421,44 @@ func (c *Client) RenameFile(fileID, newName string) error {
 			return fmt.Errorf("rename failed (%d): %s", resp.StatusCode, errResp.Error)
 		}
 		return fmt.Errorf("rename failed (%d): %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
+}
+
+func (c *Client) MoveFile(fileID, folderID string) error {
+	body := map[string]interface{}{
+		"folder_id": folderID,
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req, err := http.NewRequest("POST", c.apiURL("/files/"+fileID+"/move"), bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	for k, v := range c.headers() {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("move request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp ErrorResponse
+		if json.Unmarshal(respBody, &errResp) == nil {
+			return fmt.Errorf("move failed (%d): %s", resp.StatusCode, errResp.Error)
+		}
+		return fmt.Errorf("move failed (%d): %s", resp.StatusCode, string(respBody))
 	}
 
 	return nil

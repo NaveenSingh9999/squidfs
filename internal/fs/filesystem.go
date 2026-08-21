@@ -264,33 +264,38 @@ func (f *File) upload() error {
 }
 
 func (s *SquidFS) loadDir(dir *Dir) {
-	result, err := s.client.ListFiles(dir.id)
+	folderName := dir.name
+	if dir.id == "root" {
+		folderName = ""
+	}
+
+	result, err := s.client.ListFilesByName(folderName)
 	if err != nil {
-		log.Printf("Failed to load dir %s: %v", dir.id, err)
+		log.Printf("Failed to load dir %s: %v", dir.name, err)
 		return
 	}
 
-	for _, file := range result.Files {
-		if file.Type == "folder" {
-			subDir := &Dir{
-				squidfs: s,
-				id:      file.ID,
-				name:    file.Name,
-				path:    file.ParentFolder,
-				entries: make(map[string]*fs.Inode),
-			}
-			child := dir.NewInode(context.Background(), subDir, fs.StableAttr{Mode: fuse.S_IFDIR})
-			dir.entries[file.Name] = child
-		} else {
-			f := &File{
-				squidfs: s,
-				id:      file.ID,
-				name:    file.Name,
-				path:    file.ParentFolder,
-				size:    file.Size,
-			}
-			child := dir.NewInode(context.Background(), f, fs.StableAttr{Mode: fuse.S_IFREG})
-			dir.entries[file.Name] = child
+	for _, folder := range result.Folders {
+		subDir := &Dir{
+			squidfs: s,
+			id:      folder.ID,
+			name:    folder.Name,
+			path:    folder.ParentFolder,
+			entries: make(map[string]*fs.Inode),
 		}
+		child := dir.NewInode(context.Background(), subDir, fs.StableAttr{Mode: fuse.S_IFDIR})
+		dir.entries[folder.Name] = child
+	}
+
+	for _, file := range result.Files {
+		f := &File{
+			squidfs: s,
+			id:      file.ID,
+			name:    file.Name,
+			path:    file.ParentFolder,
+			size:    file.Size,
+		}
+		child := dir.NewInode(context.Background(), f, fs.StableAttr{Mode: fuse.S_IFREG})
+		dir.entries[file.Name] = child
 	}
 }
