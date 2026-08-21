@@ -5,201 +5,89 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
-	"runtime"
-	"strings"
+	"os/signal"
+	"syscall"
 
 	"github.com/NaveenSingh9999/squidfs/internal/api"
 	"github.com/NaveenSingh9999/squidfs/internal/cache"
 	"github.com/NaveenSingh9999/squidfs/internal/encryption"
-	squidfs "github.com/NaveenSingh9999/squidfs/internal/fs"
-	"github.com/NaveenSingh9999/squidfs/internal/mount"
 	"github.com/NaveenSingh9999/squidfs/internal/webdav"
 )
 
-const (
-	defaultCacheSize = 100 * 1024 * 1024
-	defaultCacheDir  = ".squidfs/cache"
-	defaultWebDAVPort = 8080
-	defaultBaseURL   = "https://aouqcwbdoyrccjcrhzzi.supabase.co"
-)
-
-var (
-	version   = "1.0.0"
-	buildDate = "unknown"
-)
+var version = "dev"
 
 func main() {
 	var (
-		baseURL     string
-		apiKey      string
-		mountPoint  string
-		cacheDir    string
-		cacheSize   int64
-		byokKey     string
-		webdavMode  bool
-		webdavPort  int
-		showVersion bool
-		help        bool
+		bridgeURL  string
+		apiKey     string
+		port       int
+		webdavMode bool
+		password   string
+		userID     string
+		mountPoint string
+		showVer    bool
 	)
 
-	flag.StringVar(&baseURL, "url", defaultBaseURL, "SquidCloud project URL")
-	flag.StringVar(&apiKey, "key", "", "SquidCloud API key (cb_ prefix)")
-	flag.StringVar(&mountPoint, "mount", "", "Mount point path")
-	flag.StringVar(&cacheDir, "cache-dir", defaultCacheDir, "Cache directory")
-	flag.Int64Var(&cacheSize, "cache-size", defaultCacheSize, "Cache size in bytes")
-	flag.StringVar(&byokKey, "byok", "", "BYOK encryption passphrase")
-	flag.BoolVar(&webdavMode, "webdav", false, "Use WebDAV mode instead of FUSE")
-	flag.IntVar(&webdavPort, "port", defaultWebDAVPort, "WebDAV server port")
-	flag.BoolVar(&showVersion, "version", false, "Show version")
-	flag.BoolVar(&help, "help", false, "Show help")
+	flag.StringVar(&bridgeURL, "bridge", "https://aouqcwbdoyrccjcrhzzi.supabase.co/functions/v1/squidfs-bridge", "Bridge endpoint URL")
+	flag.StringVar(&apiKey, "key", "", "CloudBliss API key (cb_ prefix)")
+	flag.IntVar(&port, "port", 8099, "WebDAV server port")
+	flag.BoolVar(&webdavMode, "webdav", true, "Run WebDAV server (default: true)")
+	flag.StringVar(&password, "password", "", "Encryption password (optional)")
+	flag.StringVar(&userID, "user", "", "User ID for encryption (optional)")
+	flag.StringVar(&mountPoint, "mount", "/mnt/squidfs", "FUSE mount point")
+	flag.BoolVar(&showVer, "version", false, "Show version")
 
 	flag.Parse()
 
-	if showVersion {
-		fmt.Printf("squidfs %s (built %s)\n", version, buildDate)
+	if showVer {
+		fmt.Printf("squidfs %s\n", version)
 		os.Exit(0)
 	}
 
-	if help || apiKey == "" {
-		printUsage()
-		os.Exit(0)
+	if apiKey == "" {
+		apiKey = os.Getenv("SQUIDCLOUD_API_KEY")
+	}
+	if apiKey == "" {
+		log.Fatal("API key required: use -key flag or SQUIDCLOUD_API_KEY env var")
 	}
 
-	if !strings.HasPrefix(apiKey, "cb_") {
-		log.Fatal("Invalid API key format. Must start with 'cb_'")
-	}
+	log.Printf("squidfs %s starting...", version)
+	log.Printf("Bridge: %s", bridgeURL)
 
-	client := api.NewClient(baseURL, apiKey)
-
-	cache, err := cache.NewCache(cacheDir, cacheSize)
+	client := api.NewClient(bridgeURL, apiKey)
+	diskCache, err := cache.NewCache("", 500*1024*1024)
 	if err != nil {
-		log.Fatalf("Failed to create cache: %v", err)
+		log.Printf("Cache init failed: %v (continuing without cache)", err)
 	}
 
 	var encryptor *encryption.Encryptor
-	if byokKey != "" {
-		userId := extractUserID(apiKey)
-		encryptor, err = encryption.NewEncryptor(byokKey, userId)
-		if err != nil {
-			log.Fatalf("Failed to create encryptor: %v", err)
+	if password != "" {
+		encUserID := userID
+		if encUserID == "" {
+			encUserID = "default"
 		}
-		log.Println("BYOK encryption enabled")
-	} else {
-		encryptor, err = encryption.NewEncryptor("", "")
+		encryptor, err = encryption.NewEncryptor(password, encUserID)
 		if err != nil {
-			log.Fatalf("Failed to create encryptor: %v", err)
+			log.Fatalf("Encryption init failed: %v", err)
 		}
+		log.Println("Encryption enabled")
 	}
 
-	if !webdavMode && isFuseAvailable() {
-		mountPoint = resolveMountPoint(mountPoint)
-		log.Printf("Mounting SquidCloud at %s", mountPoint)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-		filesystem := squidfs.New(client, cache, encryptor)
-
-		mountPoint, err := mount.Mount(mountPoint, filesystem)
-		if err != nil {
-			log.Fatalf("Failed to mount: %v", err)
-		}
-
-		log.Printf("SquidCloud mounted at %s", mountPoint.Point())
-		log.Println("Press Ctrl+C to unmount")
-	} else {
-		log.Printf("Starting WebDAV server on port %d", webdavPort)
-		server := webdav.NewServer(client, cache, encryptor, webdavPort)
+	if webdavMode {
+		server := webdav.NewServer(client, diskCache, encryptor, port)
+		go func() {
+			<-sigChan
+			server.Stop()
+			os.Exit(0)
+		}()
 		if err := server.Start(); err != nil {
-			log.Fatalf("Failed to start WebDAV server: %v", err)
+			log.Fatalf("WebDAV server error: %v", err)
 		}
+	} else {
+		log.Printf("Mount point: %s", mountPoint)
+		log.Fatal("FUSE mode not yet implemented in rewrite")
 	}
-}
-
-func printUsage() {
-	fmt.Print(`squidfs - Mount SquidCloud storage as a local filesystem
-
-Usage:
-  squidfs -key <api-key> [options]
-
-Options:
-  -key        SquidCloud API key (required, format: cb_...)
-  -url        SquidCloud project URL (default: https://aouqcwbdoyrccjcrhzzi.supabase.co)
-  -mount      Mount point path
-  -cache-dir  Cache directory (default: ~/.squidfs/cache)
-  -cache-size Cache size in bytes (default: 104857600 = 100MB)
-  -byok       BYOK encryption passphrase
-  -webdav     Use WebDAV mode instead of FUSE
-  -port       WebDAV server port (default: 8080)
-  -version    Show version
-  -help       Show help
-
-Examples:
-  # Mount with FUSE (Linux/macOS)
-  squidfs -key cb_your_api_key_here -mount /mnt/squidfs
-
-  # Mount with WebDAV (Windows/Termux)
-  squidfs -key cb_your_api_key_here -webdav
-
-  # Mount with BYOK encryption
-  squidfs -key cb_your_api_key_here -byok "your-passphrase"
-
-  # Mount with custom cache
-  squidfs -key cb_your_api_key_here -cache-dir /tmp/squidfs -cache-size 536870912
-`)
-}
-
-func isFuseAvailable() bool {
-	if runtime.GOOS == "windows" {
-		cmd := exec.Command("where", "winfsp-x64.dll")
-		return cmd.Run() == nil
-	}
-
-	cmd := exec.Command("which", "fusermount")
-	if cmd.Run() == nil {
-		return true
-	}
-
-	cmd = exec.Command("which", "fusermount3")
-	if cmd.Run() == nil {
-		return true
-	}
-
-	if _, err := os.Stat("/dev/fuse"); err == nil {
-		return true
-	}
-
-	return false
-}
-
-func resolveMountPoint(mountPoint string) string {
-	if mountPoint != "" {
-		return mountPoint
-	}
-
-	switch runtime.GOOS {
-	case "linux":
-		return "/mnt/squidfs"
-	case "darwin":
-		return "/Volumes/squidfs"
-	case "windows":
-		home, _ := os.UserHomeDir()
-		return home + "\\squidfs"
-	default:
-		home, _ := os.UserHomeDir()
-		return home + "/squidfs"
-	}
-}
-
-func extractUserID(apiKey string) string {
-	if len(apiKey) > 3 {
-		return apiKey[3:]
-	}
-	return "default"
-}
-
-func getArchitecture() string {
-	arch := runtime.GOARCH
-	if strings.Contains(arch, "arm") || strings.Contains(arch, "aarch") {
-		return "arm64"
-	}
-	return arch
 }

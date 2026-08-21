@@ -1,7 +1,9 @@
 package webdav
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -29,6 +31,7 @@ type WebDAVServer struct {
 	client     *api.Client
 	cache      *cache.Cache
 	encryptor  *encryption.Encryptor
+	httpClient *http.Client
 	listener   net.Listener
 	port       int
 	mu         sync.RWMutex
@@ -53,10 +56,36 @@ func (fi *webdavFileInfo) IsDir() bool       { return fi.isDir }
 func (fi *webdavFileInfo) Sys() interface{}  { return nil }
 
 func NewServer(client *api.Client, cache *cache.Cache, encryptor *encryption.Encryptor, port int) *WebDAVServer {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			for _, dns := range []string{"8.8.8.8:53", "1.1.1.1:53", "8.8.4.4:53"} {
+				conn, err := d.DialContext(ctx, "udp", dns)
+				if err == nil {
+					return conn, nil
+				}
+			}
+			return nil, fmt.Errorf("all DNS servers failed")
+		},
+	}
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Resolver:  resolver,
+			}).DialContext,
+			MaxIdleConns:        10,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
 	return &WebDAVServer{
 		client:     client,
 		cache:      cache,
 		encryptor:  encryptor,
+		httpClient: httpClient,
 		port:       port,
 		nameToID:   make(map[string]string),
 		fileInfo:   make(map[string]*api.FileMetadata),
@@ -69,22 +98,13 @@ func (s *WebDAVServer) registerMDNS() error {
 	if hostname == "" {
 		hostname = "squidfs"
 	}
-
 	txtRecords := []string{
 		"path=/",
 		"version=1",
 		fmt.Sprintf("port=%d", s.port),
 	}
-
 	var err error
-	s.mdns, err = zeroconf.Register(
-		hostname,
-		"_webdav._tcp",
-		"local.",
-		s.port,
-		txtRecords,
-		nil,
-	)
+	s.mdns, err = zeroconf.Register(hostname, "_webdav._tcp", "local.", s.port, txtRecords, nil)
 	if err != nil {
 		return fmt.Errorf("register mDNS: %w", err)
 	}
@@ -110,8 +130,7 @@ func (s *WebDAVServer) Start() error {
 		},
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" || r.Method == "HEAD" {
 			name := strings.TrimPrefix(r.URL.Path, "/")
 			name = strings.TrimSuffix(name, "/")
@@ -119,8 +138,10 @@ func (s *WebDAVServer) Start() error {
 				http.Error(w, "cannot GET root", 405)
 				return
 			}
+			log.Printf("GET %s", name)
 			data, err := s.downloadFile(name)
 			if err != nil {
+				log.Printf("GET %s error: %v", name, err)
 				http.NotFound(w, r)
 				return
 			}
@@ -135,7 +156,11 @@ func (s *WebDAVServer) Start() error {
 			}
 			return
 		}
-		s.handler.ServeHTTP(w, r)
+		if r.Method == "PROPFIND" {
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		}
+		sw := &stripErrorWriter{ResponseWriter: w}
+		s.handler.ServeHTTP(sw, r)
 	})
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.port))
@@ -145,7 +170,7 @@ func (s *WebDAVServer) Start() error {
 	s.listener = listener
 
 	if err := s.registerMDNS(); err != nil {
-		log.Printf("mDNS registration failed (non-fatal): %v", err)
+		log.Printf("mDNS failed (non-fatal): %v", err)
 	}
 
 	sigChan := make(chan os.Signal, 1)
@@ -153,7 +178,7 @@ func (s *WebDAVServer) Start() error {
 
 	go func() {
 		<-sigChan
-		log.Println("Received signal, shutting down...")
+		log.Println("Shutting down...")
 		s.Stop()
 		os.Exit(0)
 	}()
@@ -162,13 +187,10 @@ func (s *WebDAVServer) Start() error {
 	if hostname == "" {
 		hostname = "localhost"
 	}
-	log.Printf("WebDAV server listening on port %d", s.port)
-	log.Printf("  Direct:  http://%s:%d", hostname, s.port)
-	log.Printf("  davfs:   mount -t davfs http://%s:%d /mnt/squidfs", hostname, s.port)
-	log.Printf("  Finder:  Go to Connect to Server → http://%s:%d", hostname, s.port)
-	log.Printf("  File Manager: smb://%s:%d or dav://%s:%d", hostname, s.port, hostname, s.port)
+	log.Printf("WebDAV server on port %d", s.port)
+	log.Printf("  http://%s:%d", hostname, s.port)
 
-	return http.Serve(listener, mux)
+	return http.Serve(listener, handler)
 }
 
 func (s *WebDAVServer) Stop() error {
@@ -179,13 +201,10 @@ func (s *WebDAVServer) Stop() error {
 	return nil
 }
 
-func (s *WebDAVServer) Port() int {
-	return s.port
-}
-
 func (s *WebDAVServer) cacheEntries(dirPath string, folders []api.FolderMetadata, files []api.FileMetadata) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	for i := range folders {
 		f := &folders[i]
 		key := f.Name
@@ -193,6 +212,9 @@ func (s *WebDAVServer) cacheEntries(dirPath string, folders []api.FolderMetadata
 			key = dirPath + "/" + f.Name
 		}
 		s.nameToID[key] = f.ID
+		if f.CreatedAt.IsZero() {
+			f.CreatedAt = now
+		}
 		s.folderInfo[key] = f
 	}
 	for i := range files {
@@ -202,6 +224,12 @@ func (s *WebDAVServer) cacheEntries(dirPath string, folders []api.FolderMetadata
 			key = dirPath + "/" + f.Name
 		}
 		s.nameToID[key] = f.ID
+		if f.UpdatedAt.IsZero() {
+			f.UpdatedAt = now
+		}
+		if f.CreatedAt.IsZero() {
+			f.CreatedAt = now
+		}
 		s.fileInfo[key] = f
 	}
 }
@@ -236,11 +264,7 @@ func (s *WebDAVServer) OpenFile(ctx context.Context, name string, flag int, perm
 		if err != nil {
 			return nil, err
 		}
-		return &WebDAVDir{
-			server:  s,
-			name:    "/",
-			entries: entries,
-		}, nil
+		return &WebDAVDir{server: s, name: "/", entries: entries}, nil
 	}
 
 	parts := strings.SplitN(name, "/", 2)
@@ -261,18 +285,17 @@ func (s *WebDAVServer) OpenFile(ctx context.Context, name string, flag int, perm
 						if e.IsDir() {
 							subEntries, err := s.listDir(path.Join(topLevel, subName))
 							if err == nil {
-								return &WebDAVDir{
-									server:  s,
-									name:    subName,
-									entries: subEntries,
-								}, nil
+								return &WebDAVDir{server: s, name: subName, entries: subEntries}, nil
 							}
 						}
-						return &WebDAVFile{
-							server: s,
-							name:   name,
-							flag:   flag,
-						}, nil
+						fullKey := path.Join(topLevel, subName)
+						s.mu.RLock()
+						sfi, ok := s.fileInfo[fullKey]
+						s.mu.RUnlock()
+						if ok {
+							return &WebDAVFile{server: s, name: name, flag: flag, size: sfi.Size, existing: sfi}, nil
+						}
+						return &WebDAVFile{server: s, name: name, flag: flag}, nil
 					}
 				}
 			}
@@ -282,40 +305,18 @@ func (s *WebDAVServer) OpenFile(ctx context.Context, name string, flag int, perm
 		if err != nil {
 			return nil, err
 		}
-		return &WebDAVDir{
-			server:  s,
-			name:    topLevel,
-			entries: entries,
-		}, nil
+		return &WebDAVDir{server: s, name: topLevel, entries: entries}, nil
 	}
 
 	if isFile {
 		if flag&(os.O_WRONLY|os.O_RDWR) != 0 {
-			return &WebDAVFile{
-				server:   s,
-				name:     name,
-				flag:     flag,
-				isNew:    false,
-				existing: fi,
-			}, nil
+			return &WebDAVFile{server: s, name: name, flag: flag, isNew: false, existing: fi}, nil
 		}
-		return &WebDAVFile{
-			server:   s,
-			name:     name,
-			flag:     flag,
-			size:     fi.Size,
-			existing: fi,
-		}, nil
+		return &WebDAVFile{server: s, name: name, flag: flag, size: fi.Size, existing: fi}, nil
 	}
 
 	if flag&(os.O_CREATE|os.O_WRONLY|os.O_RDWR) != 0 {
-		return &WebDAVFile{
-			server:   s,
-			name:     name,
-			flag:     flag,
-			isNew:    true,
-			parentID: topLevel,
-		}, nil
+		return &WebDAVFile{server: s, name: name, flag: flag, isNew: true, parentID: topLevel}, nil
 	}
 
 	return nil, os.ErrNotExist
@@ -327,7 +328,6 @@ func (s *WebDAVServer) RemoveAll(ctx context.Context, name string) error {
 	if name == "" {
 		return fmt.Errorf("cannot delete root")
 	}
-
 	s.mu.RLock()
 	id, ok := s.nameToID[name]
 	s.mu.RUnlock()
@@ -352,13 +352,10 @@ func (s *WebDAVServer) Rename(ctx context.Context, oldName, newName string) erro
 func (s *WebDAVServer) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	name = strings.TrimPrefix(name, "/")
 	name = strings.TrimSuffix(name, "/")
+	now := time.Now()
 
 	if name == "" {
-		return &webdavFileInfo{
-			name:    "/",
-			isDir:   true,
-			modTime: time.Now(),
-		}, nil
+		return &webdavFileInfo{name: "/", isDir: true, modTime: now}, nil
 	}
 
 	parts := strings.SplitN(name, "/", 2)
@@ -370,55 +367,40 @@ func (s *WebDAVServer) Stat(ctx context.Context, name string) (os.FileInfo, erro
 	s.mu.RUnlock()
 
 	if isFile && len(parts) == 1 {
-		return &webdavFileInfo{
-			name:    fi.Name,
-			size:    fi.Size,
-			modTime: fi.UpdatedAt,
-			isDir:   false,
-		}, nil
+		mt := fi.UpdatedAt
+		if mt.IsZero() {
+			mt = now
+		}
+		return &webdavFileInfo{name: fi.Name, size: fi.Size, modTime: mt, isDir: false}, nil
 	}
 
 	if isFolder {
 		if len(parts) > 1 && parts[1] != "" {
 			subName := parts[1]
 			subParts := strings.SplitN(subName, "/", 2)
+			fullKey := path.Join(topLevel, subParts[0])
 			s.mu.RLock()
-			sfi, sfIsFile := s.fileInfo[subParts[0]]
-			smu, sfIsFolder := s.folderInfo[subParts[0]]
+			sfi, sfIsFile := s.fileInfo[fullKey]
+			smu, sfIsFolder := s.folderInfo[fullKey]
 			s.mu.RUnlock()
 			if sfIsFile && len(subParts) == 1 {
-				return &webdavFileInfo{
-					name:    sfi.Name,
-					size:    sfi.Size,
-					modTime: sfi.UpdatedAt,
-					isDir:   false,
-				}, nil
+				mt := sfi.UpdatedAt
+				if mt.IsZero() { mt = now }
+				return &webdavFileInfo{name: sfi.Name, size: sfi.Size, modTime: mt, isDir: false}, nil
 			}
 			if sfIsFolder {
-				return &webdavFileInfo{
-					name:    smu.Name,
-					modTime: smu.CreatedAt,
-					isDir:   true,
-				}, nil
+				mt := smu.CreatedAt
+				if mt.IsZero() { mt = now }
+				return &webdavFileInfo{name: smu.Name, modTime: mt, isDir: true}, nil
 			}
-			return &webdavFileInfo{
-				name:    subParts[0],
-				modTime: time.Now(),
-				isDir:   false,
-			}, nil
+			return &webdavFileInfo{name: subParts[0], modTime: now, isDir: false}, nil
 		}
-		return &webdavFileInfo{
-			name:    fdi.Name,
-			modTime: fdi.CreatedAt,
-			isDir:   true,
-		}, nil
+		mt := fdi.CreatedAt
+		if mt.IsZero() { mt = now }
+		return &webdavFileInfo{name: fdi.Name, modTime: mt, isDir: true}, nil
 	}
 
-	return &webdavFileInfo{
-		name:    path.Base(name),
-		modTime: time.Now(),
-		isDir:   false,
-	}, nil
+	return &webdavFileInfo{name: path.Base(name), modTime: now, isDir: false}, nil
 }
 
 func (s *WebDAVServer) listDir(dirPath string) ([]os.FileInfo, error) {
@@ -429,57 +411,144 @@ func (s *WebDAVServer) listDir(dirPath string) ([]os.FileInfo, error) {
 
 	s.cacheEntries(dirPath, result.Folders, result.Files)
 
+	now := time.Now()
+	seen := make(map[string]bool)
 	var entries []os.FileInfo
 	for _, folder := range result.Folders {
-		entries = append(entries, &webdavFileInfo{
-			name:    folder.Name,
-			modTime: folder.CreatedAt,
-			isDir:   true,
-		})
+		if seen[folder.Name] { continue }
+		seen[folder.Name] = true
+		mt := folder.CreatedAt
+		if mt.IsZero() { mt = now }
+		entries = append(entries, &webdavFileInfo{name: folder.Name, modTime: mt, isDir: true})
 	}
 	for _, file := range result.Files {
-		entries = append(entries, &webdavFileInfo{
-			name:    file.Name,
-			size:    file.Size,
-			modTime: file.UpdatedAt,
-			isDir:   false,
-		})
+		if seen[file.Name] { continue }
+		seen[file.Name] = true
+		mt := file.UpdatedAt
+		if mt.IsZero() { mt = now }
+		entries = append(entries, &webdavFileInfo{name: file.Name, size: file.Size, modTime: mt, isDir: false})
 	}
 	return entries, nil
 }
 
 func (s *WebDAVServer) downloadFile(name string) ([]byte, error) {
 	s.mu.RLock()
-	id, ok := s.nameToID[name]
+	fi, ok := s.fileInfo[name]
 	s.mu.RUnlock()
 	if !ok {
-		log.Printf("downloadFile: %q not in nameToID", name)
-		return nil, os.ErrNotExist
-	}
-	log.Printf("downloadFile: %q -> id=%s", name, id)
-
-	cacheKey := cache.CacheKey(id, 0)
-	if data, ok := s.cache.Get(cacheKey); ok {
-		return data, nil
-	}
-
-	data, err := s.client.DownloadFile(id)
-	if err != nil {
-		return nil, err
-	}
-
-	if s.encryptor.IsEnabled() {
-		decrypted, err := s.encryptor.Decrypt(data)
-		if err != nil {
-			return nil, err
+		parentDir := path.Dir(name)
+		if parentDir == "." {
+			parentDir = ""
 		}
-		data = decrypted
+		if _, err := s.listDir(parentDir); err != nil {
+			return nil, fmt.Errorf("list parent: %w", err)
+		}
+		s.mu.RLock()
+		fi, ok = s.fileInfo[name]
+		s.mu.RUnlock()
+		if !ok {
+			return nil, os.ErrNotExist
+		}
 	}
 
-	if err := s.cache.Set(cacheKey, data); err != nil {
-		log.Printf("Failed to cache file %s: %v", name, err)
+	if fi.StoragePath != "res54_distributed" {
+		return nil, fmt.Errorf("unsupported storage: %s", fi.StoragePath)
 	}
-	return data, nil
+
+	return s.downloadRes54(fi)
+}
+
+func (s *WebDAVServer) downloadRes54(fi *api.FileMetadata) ([]byte, error) {
+	cacheKey := cache.CacheKey(fi.ID, 0)
+	if s.cache != nil {
+		if data, ok := s.cache.Get(cacheKey); ok {
+			return data, nil
+		}
+	}
+
+	var tags api.FileTags
+	if fi.Tags != nil {
+		tagsRaw := fi.Tags
+		// Tags may be ["{json_string}"] — array with stringified JSON
+		if len(fi.Tags) > 0 && fi.Tags[0] == '[' {
+			var arr []json.RawMessage
+			if err := json.Unmarshal(fi.Tags, &arr); err == nil && len(arr) > 0 {
+				tagsRaw = arr[0]
+				// If arr[0] is a string, unwrap it
+				var s string
+				if err := json.Unmarshal(tagsRaw, &s); err == nil {
+					tagsRaw = []byte(s)
+				}
+			}
+		}
+		// Or it might be a bare JSON string "{...}"
+		if len(tagsRaw) > 0 && tagsRaw[0] == '"' {
+			var s string
+			if err := json.Unmarshal(tagsRaw, &s); err == nil {
+				tagsRaw = []byte(s)
+			}
+		}
+		if err := json.Unmarshal(tagsRaw, &tags); err != nil {
+			return nil, fmt.Errorf("parse tags: %w", err)
+		}
+	}
+
+	if len(tags.Chunks) == 0 {
+		return nil, fmt.Errorf("no chunks found")
+	}
+
+	var downloadChunks []api.DownloadChunkRequest
+	for _, c := range tags.Chunks {
+		downloadChunks = append(downloadChunks, api.DownloadChunkRequest{
+			Path:   c.Path,
+			Index:  c.Index,
+			Bucket: c.Bucket,
+		})
+	}
+
+	urls, err := s.client.ResolveDownloadURLs(downloadChunks)
+	if err != nil {
+		return nil, fmt.Errorf("resolve download URLs: %w", err)
+	}
+
+	urlMap := make(map[int]string)
+	for _, u := range urls {
+		urlMap[u.Index] = u.DownloadURL
+	}
+
+	var allData []byte
+	for _, c := range tags.Chunks {
+		downloadURL, ok := urlMap[c.Index]
+		if !ok {
+			return nil, fmt.Errorf("missing URL for chunk %d", c.Index)
+		}
+		resp, err := s.httpClient.Get(downloadURL)
+		if err != nil {
+			return nil, fmt.Errorf("download chunk %d: %w", c.Index, err)
+		}
+		chunkData, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read chunk %d: %w", c.Index, err)
+		}
+		allData = append(allData, chunkData...)
+	}
+
+	if s.encryptor != nil && s.encryptor.IsEnabled() && fi.Encrypted {
+		decrypted, err := s.encryptor.Decrypt(allData)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt: %w", err)
+		}
+		allData = decrypted
+	}
+
+	if s.cache != nil {
+		if err := s.cache.Set(cacheKey, allData); err != nil {
+			log.Printf("Cache write failed: %v", err)
+		}
+	}
+
+	return allData, nil
 }
 
 type WebDAVDir struct {
@@ -510,10 +579,7 @@ func (d *WebDAVDir) Readdir(count int) ([]os.FileInfo, error) {
 }
 
 func (d *WebDAVDir) Stat() (os.FileInfo, error) {
-	return &webdavFileInfo{
-		name:  d.name,
-		isDir: true,
-	}, nil
+	return &webdavFileInfo{name: d.name, isDir: true, modTime: time.Now()}, nil
 }
 
 type WebDAVFile struct {
@@ -530,9 +596,7 @@ type WebDAVFile struct {
 }
 
 func (f *WebDAVFile) Close() error {
-	if f.closed {
-		return nil
-	}
+	if f.closed { return nil }
 	f.closed = true
 
 	if f.data == nil || len(f.data) == 0 {
@@ -541,58 +605,125 @@ func (f *WebDAVFile) Close() error {
 
 	mimeType := "application/octet-stream"
 	if ext := filepath.Ext(f.name); ext != "" {
-		mimeType = mimeTypes[ext]
-		if mimeType == "" {
-			mimeType = "application/octet-stream"
+		if ct, ok := mimeTypes[ext]; ok {
+			mimeType = ct
 		}
 	}
 
 	folderID := ""
 	if f.parentID != "" {
-		s := f.server
-		s.mu.RLock()
-		fi, ok := s.folderInfo[f.parentID]
-		s.mu.RUnlock()
+		f.server.mu.RLock()
+		fi, ok := f.server.folderInfo[f.parentID]
+		f.server.mu.RUnlock()
 		if ok {
 			folderID = fi.ID
 		}
 	}
 
-	log.Printf("Uploading %s (%d bytes) to folder %q", f.name, len(f.data), folderID)
-	uploadResp, err := f.server.client.UploadFile(path.Base(f.name), f.data, mimeType, folderID)
-	if err != nil {
-		return fmt.Errorf("upload failed: %w", err)
+	log.Printf("Upload %s (%d bytes)", f.name, len(f.data))
+
+	chunksNeeded := (len(f.data) + 2*1024*1024 - 1) / (2 * 1024 * 1024)
+	if chunksNeeded == 0 {
+		chunksNeeded = 1
 	}
-	log.Printf("Upload complete: %s (id=%s)", f.name, uploadResp.File.ID)
+
+	var chunkPaths []api.ChunkUploadRequest
+	for i := 0; i < chunksNeeded; i++ {
+		chunkPaths = append(chunkPaths, api.ChunkUploadRequest{
+			Path:  fmt.Sprintf("squidfs/%s/%s_%d.bin", time.Now().Format("20060102"), f.name, i),
+			Index: i,
+		})
+	}
+
+	urls, err := f.server.client.GetUploadURLs(chunkPaths, int64(len(f.data)))
+	if err != nil {
+		return fmt.Errorf("get upload URLs: %w", err)
+	}
+
+	chunkSize := 2 * 1024 * 1024
+	for _, u := range urls {
+		start := u.Index * chunkSize
+		end := start + chunkSize
+		if end > len(f.data) {
+			end = len(f.data)
+		}
+		chunk := f.data[start:end]
+
+		req, err := http.NewRequest("PUT", u.UploadURL, bytes.NewReader(chunk))
+		if err != nil {
+			return fmt.Errorf("create PUT request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		resp, err := f.server.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("upload chunk %d: %w", u.Index, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			return fmt.Errorf("upload chunk %d failed: %d", u.Index, resp.StatusCode)
+		}
+	}
+
+	chunkMetas := make([]api.ChunkMetadata, len(urls))
+	for _, u := range urls {
+		start := u.Index * chunkSize
+		end := start + chunkSize
+		if end > len(f.data) {
+			end = len(f.data)
+		}
+		chunkMetas[u.Index] = api.ChunkMetadata{
+			Index:       u.Index,
+			TotalChunks: len(urls),
+			Size:        end - start,
+			Offset:      start,
+			Path:        u.Path,
+			Bucket:      u.Bucket,
+			ClusterID:   u.ClusterID,
+		}
+	}
+
+	tags := api.FileTags{
+		FileName: path.Base(f.name),
+		FileType: mimeType,
+		FileSize: int64(len(f.data)),
+		Chunks:   chunkMetas,
+	}
+	tagsJSON, _ := json.Marshal(tags)
+	tagsArray, _ := json.Marshal([]json.RawMessage{tagsJSON})
+
+	fileRecord := api.UploadFileRecord{
+		Name:          path.Base(f.name),
+		Type:          mimeType,
+		Size:          int64(len(f.data)),
+		StoragePath:   "res54_distributed",
+		MimeType:      mimeType,
+		Encrypted:     false,
+		ParentFolder:  folderID,
+		Tags:          tagsArray,
+	}
+
+	created, err := f.server.client.CreateFileRecord(fileRecord)
+	if err != nil {
+		return fmt.Errorf("create file record: %w", err)
+	}
 
 	f.server.mu.Lock()
-	f.server.nameToID[f.name] = uploadResp.File.ID
-	f.server.fileInfo[f.name] = &api.FileMetadata{
-		ID:           uploadResp.File.ID,
-		Name:         path.Base(f.name),
-		Size:         int64(len(f.data)),
-		MimeType:     mimeType,
-		ParentFolder: f.parentID,
-		UpdatedAt:    time.Now(),
-	}
+	f.server.nameToID[f.name] = created.ID
+	f.server.fileInfo[f.name] = created
 	f.server.mu.Unlock()
 
 	return nil
 }
 
 func (f *WebDAVFile) Read(p []byte) (n int, err error) {
-	log.Printf("Read(%s): data=%v existing=%v offset=%d", f.name, f.data != nil, f.existing != nil, f.offset)
 	if f.data == nil {
 		if f.existing != nil {
-			log.Printf("Read: downloading %s (id=%s)", f.name, f.existing.ID)
 			data, dlErr := f.server.downloadFile(f.name)
 			if dlErr != nil {
-				log.Printf("Read: download failed: %v", dlErr)
 				return 0, dlErr
 			}
 			f.data = data
 			f.size = int64(len(data))
-			log.Printf("Read: downloaded %d bytes", len(data))
 		}
 		if f.data == nil {
 			return 0, io.EOF
@@ -610,16 +741,13 @@ func (f *WebDAVFile) Write(p []byte) (n int, err error) {
 	if f.data == nil {
 		f.data = make([]byte, 0, len(p))
 	}
-
 	start := f.offset
 	end := start + int64(len(p))
-
 	if end > int64(len(f.data)) {
 		newData := make([]byte, end)
 		copy(newData, f.data)
 		f.data = newData
 	}
-
 	n = copy(f.data[start:end], p)
 	f.offset = end
 	return n, nil
@@ -649,12 +777,27 @@ func (f *WebDAVFile) Stat() (os.FileInfo, error) {
 	if f.size > sz {
 		sz = f.size
 	}
-	fi := &webdavFileInfo{
-		name: path.Base(f.name),
-		size: sz,
+	mt := time.Now()
+	if f.existing != nil && !f.existing.UpdatedAt.IsZero() {
+		mt = f.existing.UpdatedAt
 	}
-	log.Printf("Stat(%s): size=%d data=%v", f.name, sz, f.data != nil)
-	return fi, nil
+	return &webdavFileInfo{name: path.Base(f.name), size: sz, modTime: mt}, nil
+}
+
+type stripErrorWriter struct {
+	http.ResponseWriter
+	wroteBody bool
+}
+
+func (sw *stripErrorWriter) Write(b []byte) (int, error) {
+	s := string(b)
+	if sw.wroteBody && (strings.HasPrefix(s, "Internal Server Error") ||
+		strings.HasPrefix(s, "Not Found") ||
+		strings.HasPrefix(s, "Method Not Allowed")) {
+		return len(b), nil
+	}
+	sw.wroteBody = true
+	return sw.ResponseWriter.Write(b)
 }
 
 var mimeTypes = map[string]string{
