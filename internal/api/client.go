@@ -2,13 +2,17 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
+	"net/url"
 	"path"
+	"sync"
 	"time"
 )
 
@@ -16,6 +20,8 @@ type Client struct {
 	BaseURL    string
 	APIKey     string
 	HTTPClient *http.Client
+	resolvedIP string
+	resolvedMu sync.Mutex
 }
 
 type FileMetadata struct {
@@ -67,18 +73,42 @@ type ErrorResponse struct {
 }
 
 func NewClient(baseURL, apiKey string) *Client {
-	return &Client{
+	c := &Client{
 		BaseURL: baseURL,
 		APIKey:  apiKey,
-		HTTPClient: &http.Client{
-			Timeout: 5 * time.Minute,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-			},
+	}
+
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			for _, server := range []string{"8.8.8.8:53", "1.1.1.1:53", "8.8.4.4:53"} {
+				conn, err := d.DialContext(ctx, "udp", server)
+				if err == nil {
+					return conn, nil
+				}
+			}
+			return d.DialContext(ctx, network, address)
 		},
 	}
+
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Resolver:  resolver,
+	}
+
+	c.HTTPClient = &http.Client{
+		Timeout: 5 * time.Minute,
+		Transport: &http.Transport{
+			DialContext:         dialer.DialContext,
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+
+	return c
 }
 
 func (c *Client) apiURL(subpath string) string {
@@ -237,7 +267,7 @@ func (c *Client) ListFiles(folderID string) (*ListFilesResponse, error) {
 func (c *Client) ListFilesByName(folderName string) (*ListFilesResponse, error) {
 	reqURL := c.apiURL("/files?per_page=100")
 	if folderName != "" {
-		reqURL += "&folder_id=" + folderName
+		reqURL += "&folder_id=" + url.QueryEscape(folderName)
 	}
 
 	req, err := http.NewRequest("GET", reqURL, nil)
