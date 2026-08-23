@@ -30,6 +30,9 @@ import (
 )
 
 type WebDAVServer struct {
+	listCache map[string][]os.FileInfo
+	listTime  map[string]time.Time
+	listMu    sync.Mutex
 	handler    *webdav.Handler
 	client     *api.Client
 	cache      *cache.Cache
@@ -442,6 +445,16 @@ func (s *WebDAVServer) Stat(ctx context.Context, name string) (os.FileInfo, erro
 }
 
 func (s *WebDAVServer) listDir(dirPath string) ([]os.FileInfo, error) {
+	if s.listCache == nil {
+		s.listCache = make(map[string][]os.FileInfo)
+	}
+	s.listMu.Lock()
+	if ents, ok := s.listCache[dirPath]; ok && time.Since(s.listTime[dirPath]) < 15*time.Second {
+		s.listMu.Unlock()
+		return ents, nil
+	}
+	s.listMu.Unlock()
+
 	result, err := s.client.ListFilesByName(dirPath)
 	if err != nil {
 		return nil, err
@@ -466,6 +479,14 @@ func (s *WebDAVServer) listDir(dirPath string) ([]os.FileInfo, error) {
 		if mt.IsZero() { mt = now }
 		entries = append(entries, &webdavFileInfo{name: file.Name, size: file.Size, modTime: mt, isDir: false})
 	}
+	s.listMu.Lock()
+	s.listCache[dirPath] = entries
+	if s.listTime == nil {
+		s.listTime = make(map[string]time.Time)
+	}
+	s.listTime[dirPath] = time.Now()
+	s.listMu.Unlock()
+
 	return entries, nil
 }
 
@@ -656,6 +677,7 @@ type WebDAVFile struct {
 	existing *api.FileMetadata
 	parentID string
 	closed   bool
+	written  bool // true only after an actual Write() — read-only opens never upload
 }
 
 
@@ -847,8 +869,16 @@ func hasPlatformKey(t api.FileTags) bool {
 
 
 func (f *WebDAVFile) Close() error {
-	if f.closed { return nil }
+	if f.closed {
+		return nil
+	}
 	f.closed = true
+
+	// Read-only handles must NEVER trigger uploads — this was the cause of
+	// "file manager uploads everything on browse".
+	if !f.written {
+		return nil
+	}
 
 	if f.data == nil || len(f.data) == 0 {
 		return nil
@@ -873,77 +903,90 @@ func (f *WebDAVFile) Close() error {
 
 	log.Printf("Upload %s (%d bytes)", f.name, len(f.data))
 
-	keyHex, err := platform.GenerateKeyHex()
-	if err != nil {
-		return fmt.Errorf("generate key: %w", err)
-	}
-
 	chunksNeeded := (len(f.data) + platform.ChunkSize() - 1) / platform.ChunkSize()
 	if chunksNeeded == 0 {
 		chunksNeeded = 1
 	}
 
-	var chunkPaths []api.ChunkUploadRequest
+	keyHex, err := platform.GenerateKeyHex()
+	if err != nil {
+		return fmt.Errorf("generate key: %w", err)
+	}
+
+	chunkPaths := make([]api.ChunkUploadRequest, chunksNeeded)
 	for i := 0; i < chunksNeeded; i++ {
-		chunkPaths = append(chunkPaths, api.ChunkUploadRequest{
-			Path:  fmt.Sprintf("squidfs/%s/%s_%d.bin", time.Now().Format("20060102"), f.name, i),
+		chunkPaths[i] = api.ChunkUploadRequest{
+			Path:  fmt.Sprintf("squidfs/%s/%s_%d.bin", time.Now().Format("20060102"), filepath.Base(f.name), i),
 			Index: i,
-		})
+		}
 	}
 
 	urls, err := f.server.client.GetUploadURLs(chunkPaths, int64(len(f.data)))
 	if err != nil {
 		return fmt.Errorf("get upload URLs: %w", err)
 	}
-
-	chunkSize := platform.ChunkSize()
+	urlMap := make(map[int]api.UploadURLInfo, len(urls))
 	for _, u := range urls {
-		start := u.Index * chunkSize
-		end := start + chunkSize
-		if end > len(f.data) {
-			end = len(f.data)
-		}
-		chunk := f.data[start:end]
-
-		if keyHex != "" {
-			key := platform.DeriveKey(keyHex)
-			sealed, err := platform.EncryptChunk(key, chunk)
-			if err != nil {
-				return fmt.Errorf("encrypt chunk %d: %w", u.Index, err)
-			}
-			chunk = sealed
-		}
-
-		req, err := http.NewRequest("PUT", u.UploadURL, bytes.NewReader(chunk))
-		if err != nil {
-			return fmt.Errorf("create PUT request: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/octet-stream")
-		resp, err := f.server.httpClient.Do(req)
-		if err != nil {
-			return fmt.Errorf("upload chunk %d: %w", u.Index, err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode >= 300 {
-			return fmt.Errorf("upload chunk %d failed: %d", u.Index, resp.StatusCode)
-		}
+		urlMap[u.Index] = u
 	}
 
-	chunkMetas := make([]api.ChunkMetadata, len(urls))
-	for _, u := range urls {
-		start := u.Index * chunkSize
-		end := start + chunkSize
-		if end > len(f.data) {
-			end = len(f.data)
-		}
-		chunkMetas[u.Index] = api.ChunkMetadata{
-			Index:       u.Index,
-			TotalChunks: len(urls),
-			Size:        end - start,
-			Offset:      start,
-			Path:        u.Path,
-			Bucket:      u.Bucket,
-			ClusterID:   u.ClusterID,
+	key := platform.DeriveKey(keyHex)
+	chunkSize := platform.ChunkSize()
+
+	var mu sync.Mutex
+	var firstErr error
+	sem := make(chan struct{}, stream.Workers)
+	var wg sync.WaitGroup
+
+	for i := 0; i < chunksNeeded; i++ {
+		i := i
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			u, ok := urlMap[i]
+			if !ok { return }
+			st := i * chunkSize
+			en := st + chunkSize
+			if en > len(f.data) { en = len(f.data) }
+			sealed, serr := platform.EncryptChunk(key, f.data[st:en])
+			if serr != nil {
+				mu.Lock(); if firstErr == nil { firstErr = serr }; mu.Unlock()
+				return
+			}
+			req, rerr := http.NewRequest(http.MethodPut, u.UploadURL, bytes.NewReader(sealed))
+			if rerr != nil {
+				mu.Lock(); if firstErr == nil { firstErr = rerr }; mu.Unlock()
+				return
+			}
+			req.Header.Set("Content-Type", "application/octet-stream")
+			resp, derr := f.server.httpClient.Do(req)
+			if derr != nil {
+				mu.Lock(); if firstErr == nil { firstErr = derr }; mu.Unlock()
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode >= 300 {
+				mu.Lock(); if firstErr == nil { firstErr = fmt.Errorf("chunk %d HTTP %d", i, resp.StatusCode) }; mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+
+	chunkMetas := make([]api.ChunkMetadata, chunksNeeded)
+	for i := 0; i < chunksNeeded; i++ {
+		u := urls[i]
+		st := i * chunkSize
+		en := st + chunkSize
+		if en > len(f.data) { en = len(f.data) }
+		chunkMetas[i] = api.ChunkMetadata{
+			Index: i, TotalChunks: chunksNeeded, Size: en - st, Offset: st,
+			Path: u.Path, Bucket: u.Bucket, ClusterID: u.ClusterID,
 		}
 	}
 
@@ -976,13 +1019,33 @@ func (f *WebDAVFile) Close() error {
 
 	f.server.mu.Lock()
 	f.server.nameToID[f.name] = created.ID
-	f.server.fileInfo[f.name] = created
+	if fi, err2 := f.server.client.GetFile(created.ID); err2 == nil {
+		f.server.fileInfo[f.name] = fi
+	}
 	f.server.mu.Unlock()
 
 	return nil
 }
 
+
+const lazyReadThreshold = 8 * 1024 * 1024 // >8MB → chunk-streamed
+
 func (f *WebDAVFile) Read(p []byte) (n int, err error) {
+	// Large read-only files: pull only the chunks covering [offset, offset+len)
+	if f.written == false && f.existing != nil && f.existing.Size > lazyReadThreshold && f.offset < f.existing.Size {
+		want := int64(len(p))
+		data, rerr := f.server.readRangeLazy(f.existing, f.offset, want)
+		if rerr != nil {
+			return 0, rerr
+		}
+		n = copy(p, data)
+		f.offset += int64(n)
+		if n == 0 {
+			return 0, io.EOF
+		}
+		return n, nil
+	}
+
 	if f.data == nil {
 		if f.existing != nil {
 			data, dlErr := f.server.downloadFile(f.name)
@@ -1005,6 +1068,7 @@ func (f *WebDAVFile) Read(p []byte) (n int, err error) {
 }
 
 func (f *WebDAVFile) Write(p []byte) (n int, err error) {
+	f.written = true
 	if f.data == nil {
 		f.data = make([]byte, 0, len(p))
 	}

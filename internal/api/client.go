@@ -4,7 +4,6 @@ import (
 	"strings"
 	"path/filepath"
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -117,19 +116,7 @@ var mimeTypes = map[string]string{
 }
 
 func NewClient(bridgeURL, apiKey string) *Client {
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			for _, server := range []string{"8.8.8.8:53", "1.1.1.1:53"} {
-				conn, err := d.DialContext(ctx, "udp", server)
-				if err == nil {
-					return conn, nil
-				}
-			}
-			return d.DialContext(ctx, network, address)
-		},
-	}
+
 
 	return &Client{
 		bridgeURL: bridgeURL,
@@ -140,8 +127,7 @@ func NewClient(bridgeURL, apiKey string) *Client {
 				DialContext: (&net.Dialer{
 					Timeout:   10 * time.Second,
 					KeepAlive: 30 * time.Second,
-					Resolver:  resolver,
-				}).DialContext,
+					}).DialContext,
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
 				IdleConnTimeout:     90 * time.Second,
@@ -164,7 +150,7 @@ func (c *Client) callBridge(action string, params map[string]interface{}) (*Brid
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("apikey", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFvdXFjd2jkb3lyY2NqY3JoepppIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDI5NjAyMTEsImV4cCI6MTk5ODUzNjIxMX0.zMWVYnM2zGEBMVJMBib5RnU4MQPfBOKmNXpU31xBVlI")
+	req.Header.Set("apikey", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFvdXFjd2Jkb3lyY2NqY3Joenp6aSIsInJvbGUiOiJhbm9uIiwiaWF0IjoxNzQyOTYwMjExLCJleHAiOjIwNTg1MzYyMTF9.b_VHC6uP3Efw3o_yibCoZKmsCIVZg0J4FUF1NK-nd7U")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
