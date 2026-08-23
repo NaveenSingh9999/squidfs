@@ -1,6 +1,7 @@
 package webdav
 
 import (
+	"strconv"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -23,6 +24,8 @@ import (
 
 	"github.com/NaveenSingh9999/squidfs/internal/api"
 	"github.com/NaveenSingh9999/squidfs/internal/cache"
+	"github.com/NaveenSingh9999/squidfs/internal/platform"
+	"github.com/NaveenSingh9999/squidfs/internal/stream"
 	"github.com/NaveenSingh9999/squidfs/internal/encryption"
 )
 
@@ -139,7 +142,41 @@ func (s *WebDAVServer) Start() error {
 				return
 			}
 			log.Printf("GET %s", name)
-			data, err := s.downloadFile(name)
+
+			fi, err := s.statFor(name)
+			if err == nil && fi.StoragePath == "res54_distributed" {
+				w.Header().Set("Accept-Ranges", "bytes")
+			}
+
+			rangeHdr := r.Header.Get("Range")
+			var start, length int64
+			hasRange := false
+			if rangeHdr != "" && fi != nil {
+				if parsed, ok := parseByteRange(rangeHdr, fi.Size); ok {
+					start, length = parsed.start, parsed.length
+					hasRange = true
+				}
+			}
+
+			var data []byte
+			if hasRange && fi.StoragePath == "res54_distributed" {
+				data, err = s.readRangeLazy(fi, start, length)
+				if err != nil {
+					log.Printf("GET %s range error: %v", name, err)
+					http.Error(w, "range read failed", http.StatusInternalServerError)
+					return
+				}
+				ct := mimeTypes[path.Ext(name)]
+				if ct == "" { ct = "application/octet-stream" }
+				w.Header().Set("Content-Type", ct)
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+int64(len(data))-1, fi.Size))
+				w.WriteHeader(http.StatusPartialContent)
+				if r.Method == "GET" { w.Write(data) }
+				return
+			}
+
+			data, err = s.downloadFile(name)
 			if err != nil {
 				log.Printf("GET %s error: %v", name, err)
 				http.NotFound(w, r)
@@ -150,6 +187,7 @@ func (s *WebDAVServer) Start() error {
 				ct = "application/octet-stream"
 			}
 			w.Header().Set("Content-Type", ct)
+			w.Header().Set("Accept-Ranges", "bytes")
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
 			if r.Method == "GET" {
 				w.Write(data)
@@ -516,7 +554,7 @@ func (s *WebDAVServer) downloadRes54(fi *api.FileMetadata) ([]byte, error) {
 		urlMap[u.Index] = u.DownloadURL
 	}
 
-	var allData []byte
+	chunkBlobs := make([][]byte, 0, len(tags.Chunks))
 	for _, c := range tags.Chunks {
 		downloadURL, ok := urlMap[c.Index]
 		if !ok {
@@ -531,15 +569,40 @@ func (s *WebDAVServer) downloadRes54(fi *api.FileMetadata) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read chunk %d: %w", c.Index, err)
 		}
-		allData = append(allData, chunkData...)
+		chunkBlobs = append(chunkBlobs, chunkData)
 	}
 
-	if s.encryptor != nil && s.encryptor.IsEnabled() && fi.Encrypted {
-		decrypted, err := s.encryptor.Decrypt(allData)
+	hasPlatformKey := tags.EncryptionKey != "" &&
+		tags.EncryptionKey != "sha256:byok_encrypted" &&
+		tags.EncryptionKey != "byok_encrypted" &&
+		tags.EncryptionKey != "managed_key"
+
+	var allData []byte
+	switch {
+	case hasPlatformKey:
+		key := platform.DeriveKey(tags.EncryptionKey)
+		for _, blob := range chunkBlobs {
+			plain, err := platform.DecryptChunk(key, blob)
+			if err != nil {
+				allData = append(allData, blob...)
+				continue
+			}
+			allData = append(allData, plain...)
+		}
+	case s.encryptor != nil && s.encryptor.IsEnabled() && fi.Encrypted:
+		blob := make([]byte, 0, 4096)
+		for _, b := range chunkBlobs {
+			blob = append(blob, b...)
+		}
+		decrypted, err := s.encryptor.Decrypt(blob)
 		if err != nil {
 			return nil, fmt.Errorf("decrypt: %w", err)
 		}
 		allData = decrypted
+	default:
+		for _, b := range chunkBlobs {
+			allData = append(allData, b...)
+		}
 	}
 
 	if s.cache != nil {
@@ -595,6 +658,194 @@ type WebDAVFile struct {
 	closed   bool
 }
 
+
+// statFor resolves file metadata by DAV path.
+func (s *WebDAVServer) statFor(name string) (*api.FileMetadata, error) {
+	s.mu.RLock()
+	fi, ok := s.fileInfo[name]
+	s.mu.RUnlock()
+	if ok {
+		return fi, nil
+	}
+	parentDir := path.Dir(name)
+	if parentDir == "." { parentDir = "" }
+	if _, err := s.listDir(parentDir); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	fi, ok = s.fileInfo[name]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return fi, nil
+}
+
+type byteRange struct{ start, length int64 }
+
+func parseByteRange(h string, total int64) (byteRange, bool) {
+	var br byteRange
+	if !strings.HasPrefix(h, "bytes=") || total <= 0 {
+		return br, false
+	}
+	spec := strings.TrimPrefix(h, "bytes=")
+	if i := strings.Index(spec, ","); i >= 0 { spec = spec[:i] } // first range only
+	parts := strings.SplitN(spec, "-", 2)
+	if len(parts) != 2 { return br, false }
+	if parts[0] == "" {
+		// suffix form bytes=-N
+		n, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || n <= 0 { return br, false }
+		if n > total { n = total }
+		br.start = total - n
+		br.length = n
+		return br, true
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || start < 0 || start >= total { return br, false }
+	end := total - 1
+	if parts[1] != "" {
+		e, e2 := strconv.ParseInt(parts[1], 10, 64)
+		if e2 != nil || e < start { return br, false }
+		if e < end { end = e }
+	}
+	br.start = start
+	br.length = end - start + 1
+	return br, true
+}
+
+// readRangeLazy fetches and decrypts only the chunks covering [start,len).
+func (s *WebDAVServer) readRangeLazy(fi *api.FileMetadata, start, length int64) ([]byte, error) {
+	if length <= 0 { return []byte{}, nil }
+	if start+length > fi.Size { length = fi.Size - start }
+
+	var tags api.FileTags
+	tagsRaw := fi.Tags
+	if len(tagsRaw) > 0 && tagsRaw[0] == '[' {
+		var arr []json.RawMessage
+		if err := json.Unmarshal(tagsRaw, &arr); err == nil && len(arr) > 0 {
+			tagsRaw = arr[0]
+			var str string
+			if err := json.Unmarshal(tagsRaw, &str); err == nil { tagsRaw = []byte(str) }
+		}
+	} else if len(tagsRaw) > 0 && tagsRaw[0] == '"' {
+		var str string
+		if err := json.Unmarshal(tagsRaw, &str); err == nil { tagsRaw = []byte(str) }
+	}
+	if err := json.Unmarshal(tagsRaw, &tags); err != nil {
+		return nil, fmt.Errorf("parse tags: %w", err)
+	}
+
+	keyRaw := platform.DeriveKey(tags.EncryptionKey)
+
+	idx := stream.ChunksCovering(start, length)
+
+	// Serve cached chunks immediately; collect misses for parallel fetch.
+	parts := make([][]byte, len(idx))
+	var missIdx []int
+	for j, ci := range idx {
+		var ck string
+		if s.cache != nil {
+			ck = cache.CacheKey(fi.ID, ci)
+			if d, ok := s.cache.Get(ck); ok {
+			parts[j] = sliceChunk(d, start, length, ci)
+			continue
+		}
+		}
+		missIdx = append(missIdx, ci)
+	}
+
+	if len(missIdx) > 0 {
+		reqs := make([]api.DownloadChunkRequest, len(missIdx))
+		for j, ci := range missIdx {
+			reqs[j] = api.DownloadChunkRequest{
+				Path: tags.Chunks[ci].Path, Index: ci, Bucket: tags.Chunks[ci].Bucket,
+			}
+		}
+		resolved, err := s.client.ResolveDownloadURLs(reqs)
+		if err != nil {
+			return nil, fmt.Errorf("resolve: %w", err)
+		}
+		umap := make(map[int]string, len(resolved))
+		for _, u := range resolved {
+			umap[u.Index] = u.DownloadURL
+		}
+
+		fetched := make([][]byte, len(missIdx))
+		var fetchMu sync.Mutex
+		errFetch := stream.FetchChunksParallel(s.httpClient, umap, missIdx, func(i int, blob []byte) {
+			var plain []byte
+			if hasPlatformKey(tags) {
+				if p, derr := platform.DecryptChunk(platform.DeriveKey(tags.EncryptionKey), blob); derr == nil {
+					plain = p
+				} else {
+					plain = blob
+				}
+			} else if s.encryptor != nil && s.encryptor.IsEnabled() && fi.Encrypted {
+				if p, derr := s.encryptor.Decrypt(blob); derr == nil {
+					plain = p
+				} else {
+					plain = blob
+				}
+			} else {
+				plain = blob
+			}
+			s.cache.Set(cache.CacheKey(fi.ID, i), plain)
+			fetchMu.Lock()
+			for j, ci := range missIdx {
+				if ci == i {
+					fetched[j] = plain
+					break
+				}
+			}
+			fetchMu.Unlock()
+		})
+		if errFetch != nil {
+			return nil, errFetch
+		}
+
+		fj := 0
+		for j, ci := range idx {
+			if parts[j] == nil && fj < len(missIdx) && missIdx[fj] == ci {
+				parts[j] = fetched[fj]
+				fj++
+			}
+		}
+	}
+
+	_ = keyRaw
+
+	out := make([]byte, 0, length)
+	for _, p := range parts {
+		if p == nil {
+			continue
+		}
+		out = append(out, p...)
+	}
+	if max := fi.Size - start; int64(len(out)) > max && max >= 0 {
+		out = out[:max]
+	}
+	return out, nil
+}
+
+func sliceChunk(chunk []byte, off, total int64, idx int) []byte {
+	cs := int64(stream.ChunkSize)
+	cStart := int64(idx) * cs
+	sOff := off - cStart
+	if sOff < 0 { sOff = 0 }
+	eOff := (off + total) - cStart
+	if eOff > int64(len(chunk)) { eOff = int64(len(chunk)) }
+	if sOff >= int64(len(chunk)) || sOff >= eOff { return nil }
+	return chunk[sOff:eOff]
+}
+
+func hasPlatformKey(t api.FileTags) bool {
+	k := t.EncryptionKey
+	return k != "" && k != "managed_key" && k != "sha256:byok_encrypted" &&
+		k != "byok_encrypted" && k != "byok_protected"
+}
+
+
 func (f *WebDAVFile) Close() error {
 	if f.closed { return nil }
 	f.closed = true
@@ -622,7 +873,12 @@ func (f *WebDAVFile) Close() error {
 
 	log.Printf("Upload %s (%d bytes)", f.name, len(f.data))
 
-	chunksNeeded := (len(f.data) + 2*1024*1024 - 1) / (2 * 1024 * 1024)
+	keyHex, err := platform.GenerateKeyHex()
+	if err != nil {
+		return fmt.Errorf("generate key: %w", err)
+	}
+
+	chunksNeeded := (len(f.data) + platform.ChunkSize() - 1) / platform.ChunkSize()
 	if chunksNeeded == 0 {
 		chunksNeeded = 1
 	}
@@ -640,7 +896,7 @@ func (f *WebDAVFile) Close() error {
 		return fmt.Errorf("get upload URLs: %w", err)
 	}
 
-	chunkSize := 2 * 1024 * 1024
+	chunkSize := platform.ChunkSize()
 	for _, u := range urls {
 		start := u.Index * chunkSize
 		end := start + chunkSize
@@ -648,6 +904,15 @@ func (f *WebDAVFile) Close() error {
 			end = len(f.data)
 		}
 		chunk := f.data[start:end]
+
+		if keyHex != "" {
+			key := platform.DeriveKey(keyHex)
+			sealed, err := platform.EncryptChunk(key, chunk)
+			if err != nil {
+				return fmt.Errorf("encrypt chunk %d: %w", u.Index, err)
+			}
+			chunk = sealed
+		}
 
 		req, err := http.NewRequest("PUT", u.UploadURL, bytes.NewReader(chunk))
 		if err != nil {
@@ -683,23 +948,25 @@ func (f *WebDAVFile) Close() error {
 	}
 
 	tags := api.FileTags{
-		FileName: path.Base(f.name),
-		FileType: mimeType,
-		FileSize: int64(len(f.data)),
-		Chunks:   chunkMetas,
+		FileName:      path.Base(f.name),
+		FileType:      mimeType,
+		FileSize:      int64(len(f.data)),
+		EncryptionKey: keyHex,
+		Created:       time.Now().UTC().Format(time.RFC3339),
+		Chunks:        chunkMetas,
 	}
 	tagsJSON, _ := json.Marshal(tags)
 	tagsArray, _ := json.Marshal([]json.RawMessage{tagsJSON})
 
 	fileRecord := api.UploadFileRecord{
-		Name:          path.Base(f.name),
-		Type:          mimeType,
-		Size:          int64(len(f.data)),
-		StoragePath:   "res54_distributed",
-		MimeType:      mimeType,
-		Encrypted:     false,
-		ParentFolder:  folderID,
-		Tags:          tagsArray,
+		Name:         path.Base(f.name),
+		Type:         mimeType,
+		Size:         int64(len(f.data)),
+		StoragePath:  "res54_distributed",
+		MimeType:     mimeType,
+		Encrypted:    true,
+		ParentFolder: folderID,
+		Tags:         tagsArray,
 	}
 
 	created, err := f.server.client.CreateFileRecord(fileRecord)

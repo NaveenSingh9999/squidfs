@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"os"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -20,6 +21,8 @@ import (
 	"github.com/NaveenSingh9999/squidfs/internal/api"
 	"github.com/NaveenSingh9999/squidfs/internal/cache"
 	"github.com/NaveenSingh9999/squidfs/internal/encryption"
+	"github.com/NaveenSingh9999/squidfs/internal/platform"
+	"github.com/NaveenSingh9999/squidfs/internal/stream"
 )
 
 type SquidFS struct {
@@ -49,7 +52,20 @@ type File struct {
 	size    int64
 	data    []byte
 	mu      sync.RWMutex
+
+	// high-performance state
+	dirty     bool
+	tmpPath   string // spool for large writes
+	lazy      bool   // serve reads via chunk cache (large files)
+	chunks    []api.ChunkMetadata
+	keyHex    string // platform key for this file ('' = none)
+	platKeyOK bool
+	modTime   time.Time
 }
+
+// uploadSignature tracks the last persisted content so unchanged files are
+// never re-uploaded (file managers rewrite files constantly).
+var uploadSignatures sync.Map // id -> "size:modUnixNano"
 
 func New(client *api.Client, cache *cache.Cache, encryptor *encryption.Encryptor) *SquidFS {
 	resolver := &net.Resolver{
@@ -178,26 +194,185 @@ func (f *File) Getattr(ctx context.Context, out *fuse.AttrOut, fh uint64) syscal
 
 func (f *File) Read(ctx context.Context, data []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	f.mu.RLock()
-	defer f.mu.RUnlock()
+	dirty := f.dirty
+	lazy := f.lazy
+	size := f.size
+	f.mu.RUnlock()
 
-	if f.data == nil {
-		if err := f.download(); err != nil {
-			log.Printf("Download error for %s: %v", f.id, err)
-			return nil, syscall.EIO
-		}
-	}
-
-	if off >= int64(len(f.data)) {
+	if off >= size {
 		return nil, 0
 	}
 
-	end := off + int64(len(data))
-	if end > int64(len(f.data)) {
-		end = int64(len(f.data))
+	// Dirty (being written) or small files: serve from the in-memory copy.
+	if dirty || !lazy {
+		if f.data == nil {
+			f.mu.Lock()
+			if err := f.download(); err != nil {
+				f.mu.Unlock()
+				log.Printf("Download error for %s: %v", f.id, err)
+				return nil, syscall.EIO
+			}
+			f.mu.Unlock()
+		}
+		f.mu.RLock()
+		defer f.mu.RUnlock()
+		if off >= int64(len(f.data)) {
+			return nil, 0
+		}
+		end := off + int64(len(data))
+		if end > int64(len(f.data)) {
+			end = int64(len(f.data))
+		}
+		return fuse.ReadResultData(f.data[off:end]), 0
 	}
 
-	return fuse.ReadResultData(f.data[off:end]), 0
+	// Lazy path: pull only the chunks covering this read.
+	want := int64(len(data))
+	if remaining := size - off; remaining < want {
+		want = remaining
+	}
+	plain, err := f.readRange(off, want)
+	if err != nil {
+		log.Printf("Range read error for %s@%d: %v", f.name, off, err)
+		return nil, syscall.EIO
+	}
+	n := copy(data, plain)
+	// Prefetch the next window in the background for sequential readers.
+	go func(next int64) {
+		if _, err := f.readRange(next, 4*1024*1024); err != nil {
+			log.Printf("prefetch error: %v", err)
+		}
+	}(off + want)
+	return fuse.ReadResultData(plain[:n]), 0
 }
+
+// readRange returns exactly `length` bytes of file plaintext starting at off
+// (clamped to file size), pulling/decrypting only the chunks involved.
+func (f *File) readRange(off, length int64) ([]byte, error) {
+	if length <= 0 {
+		return []byte{}, nil
+	}
+	if off+length > f.size {
+		length = f.size - off
+	}
+	if length <= 0 {
+		return []byte{}, nil
+	}
+
+	idx := stream.ChunksCovering(off, length)
+	out := make([]byte, 0, length)
+
+	var urls map[int]string
+	getURL := func(i int) (string, error) {
+		if urls == nil {
+			reqs := make([]api.DownloadChunkRequest, len(f.chunks))
+			for j, c := range f.chunks {
+				reqs[j] = api.DownloadChunkRequest{Path: c.Path, Index: c.Index, Bucket: c.Bucket}
+			}
+			resolved, err := f.squidfs.client.ResolveDownloadURLs(reqs)
+			if err != nil {
+				return "", err
+			}
+			urls = make(map[int]string, len(resolved))
+			for _, u := range resolved {
+				urls[u.Index] = u.DownloadURL
+			}
+		}
+		u, ok := urls[i]
+		if !ok {
+			return "", fmt.Errorf("no url for chunk %d", i)
+		}
+		return u, nil
+	}
+
+	keyRaw := platform.DeriveKey(f.keyHex)
+
+	for _, ci := range idx {
+		ck := cache.CacheKey(f.id, ci)
+		if cached, ok := f.squidfs.cache.Get(ck); ok {
+			out = append(out, sliceFor(cached, off, length, ci)...)
+			continue
+		}
+		u, err := getURL(ci)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := f.squidfs.httpClient.Get(u)
+		if err != nil {
+			return nil, fmt.Errorf("chunk %d fetch: %w", ci, err)
+		}
+		blob, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("chunk %d read: %w", ci, err)
+		}
+
+		var plain []byte
+		if f.platKeyOK {
+			p2, derr := platform.DecryptChunk(keyRaw, blob)
+			if derr != nil {
+				plain = blob // legacy raw passthrough
+			} else {
+				plain = p2
+			}
+		} else if f.squidfs.encryptor != nil {
+			p3, derr := f.squidfs.encryptor.Decrypt(blob)
+			if derr != nil { plain = blob } else { plain = p3 }
+		} else {
+			plain = blob
+		}
+
+		f.squidfs.cache.Set(ck, plain)
+
+		s := sliceFor(plain, off, length, ci)
+		out = append(out, s...)
+
+		// background prefetch of the following chunk
+		if ci+1 < len(f.chunks) {
+			go func(nx int) {
+				_ = prefetchChunk(f, nx)
+			}(ci + 1)
+		}
+	}
+	return out, nil
+}
+
+func sliceFor(chunk []byte, off, total int64, chunkIndex int) []byte {
+	cs := int64(stream.ChunkSize)
+	start := int64(chunkIndex) * cs
+	sOff := off - start
+	if sOff < 0 { sOff = 0 }
+	eOff := (off + total) - start
+	if eOff > int64(len(chunk)) { eOff = int64(len(chunk)) }
+	if sOff >= int64(len(chunk)) || sOff >= eOff { return nil }
+	return chunk[sOff:eOff]
+}
+
+func prefetchChunk(f *File, index int) error {
+	ck := cache.CacheKey(f.id, index)
+	if f.squidfs.cache.Has(ck) { return nil }
+	reqs := make([]api.DownloadChunkRequest, len(f.chunks))
+	for j, c := range f.chunks { reqs[j] = api.DownloadChunkRequest{Path: c.Path, Index: c.Index, Bucket: c.Bucket} }
+	resolved, err := f.squidfs.client.ResolveDownloadURLs(reqs)
+	if err != nil { return err }
+	for _, u := range resolved {
+		if u.Index != index { continue }
+		resp, err := f.squidfs.httpClient.Get(u.DownloadURL)
+		if err != nil { return err }
+		blob, err := io.ReadAll(resp.Body); resp.Body.Close()
+		if err != nil { return err }
+		var plain []byte
+		keyRaw := platform.DeriveKey(f.keyHex)
+		if f.platKeyOK {
+			if p, derr := platform.DecryptChunk(keyRaw, blob); derr == nil { plain = p } else { plain = blob }
+		} else { plain = blob }
+		f.squidfs.cache.Set(ck, plain)
+		return nil
+	}
+	return fmt.Errorf("no url")
+}
+
+const spoolThreshold = 32 * 1024 * 1024
 
 func (f *File) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	f.mu.Lock()
@@ -206,20 +381,115 @@ func (f *File) Write(ctx context.Context, data []byte, off int64) (uint32, sysca
 	start := int(off)
 	end := start + len(data)
 
-	if end > len(f.data) {
-		newData := make([]byte, end)
-		copy(newData, f.data)
-		f.data = newData
+	// Large writes spill to a temp file instead of RAM.
+	if end > spoolThreshold && f.tmpPath == "" {
+		tmp, err := os.CreateTemp("", "squidfs-write-*")
+		if err != nil {
+			return 0, syscall.EIO
+		}
+		f.tmpPath = tmp.Name()
+		tmp.Write(f.data)
+		tmp.Close()
+	}
+	if f.tmpPath != "" {
+		tf, err := os.OpenFile(f.tmpPath, os.O_RDWR|os.O_CREATE, 0644)
+		if err != nil {
+			return 0, syscall.EIO
+		}
+		tf.WriteAt(data, off)
+		tf.Close()
+		if end > len(f.data) {
+			f.data = make([]byte, end)
+		} else {
+			f.data = f.data[:end]
+		}
+	} else {
+		if end > len(f.data) {
+			grown := make([]byte, end)
+			copy(grown, f.data)
+			f.data = grown
+		}
+		copy(f.data[start:end], data)
 	}
 
-	copy(f.data[start:end], data)
+	f.size = int64(end)
+	now := time.Now()
+	f.modTime = now
+	f.dirty = true
+
+	// No upload here — Flush/Release triggers exactly one upload per close.
+	return uint32(len(data)), 0
+}
+
+// Flush fires when an application fsyncs/closes the file.
+func (f *File) Flush(ctx context.Context, fh uint64) syscall.Errno {
+	f.mu.Lock()
+	dirty := f.dirty
+	f.mu.Unlock()
+	if !dirty {
+		return 0
+	}
+	if err := f.uploadOnce(); err != nil {
+		log.Printf("Upload error for %s: %v", f.name, err)
+		return syscall.EIO
+	}
+	return 0
+}
+
+// Release is the final close; uploads anything Flush missed.
+func (f *File) Release(ctx context.Context, fh uint64) syscall.Errno {
+	f.mu.RLock()
+	dirty := f.dirty
+	f.mu.RUnlock()
+	if dirty {
+		if err := f.uploadOnce(); err != nil {
+			log.Printf("Release upload error for %s: %v", f.name, err)
+		}
+	}
+	return 0
+}
+
+// uploadOnce persists the file exactly once per close cycle and skips
+// re-uploads of identical content entirely.
+func (f *File) uploadOnce() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.dirty {
+		return nil
+	}
+
+	var data []byte
+	if f.tmpPath != "" {
+		b, err := os.ReadFile(f.tmpPath)
+		if err != nil {
+			return fmt.Errorf("read spool: %w", err)
+		}
+		data = b
+	} else {
+		data = f.data
+	}
+	if len(data) == 0 {
+		f.dirty = false
+		return nil
+	}
+
+	sig := fmt.Sprintf("%d:%d", len(data), f.modTime.UnixNano())
+	if prev, ok := uploadSignatures.Load(f.id); ok && prev == sig && f.platKeyOK {
+		log.Printf("skip upload (unchanged): %s", f.name)
+		f.dirty = false
+		return nil
+	}
 
 	if err := f.upload(); err != nil {
-		log.Printf("Upload error for %s: %v", f.name, err)
-		return 0, syscall.EIO
+		return err
 	}
 
-	return uint32(len(data)), 0
+	uploadSignatures.Store(f.id, sig)
+	f.dirty = false
+
+	os.Remove(f.tmpPath)
+	f.tmpPath = ""
+	return nil
 }
 
 func (f *File) download() error {
@@ -286,7 +556,10 @@ func (f *File) download() error {
 		urlMap[u.Index] = u.DownloadURL
 	}
 
-	var allData []byte
+	// Fetch every chunk object. Platform files keep one res54 envelope per
+	// chunk; legacy squidfs files are raw slices (optionally whole-file
+	// encrypted by the local encryptor).
+	chunkBlobs := make([][]byte, 0, len(tags.Chunks))
 	for _, c := range tags.Chunks {
 		downloadURL, ok := urlMap[c.Index]
 		if !ok {
@@ -301,15 +574,41 @@ func (f *File) download() error {
 		if err != nil {
 			return fmt.Errorf("read chunk %d: %w", c.Index, err)
 		}
-		allData = append(allData, chunkData...)
+		chunkBlobs = append(chunkBlobs, chunkData)
 	}
 
-	if fileMeta.Encrypted && f.squidfs.encryptor.IsEnabled() {
-		decrypted, err := f.squidfs.encryptor.Decrypt(allData)
+	hasPlatformKey := tags.EncryptionKey != "" &&
+		tags.EncryptionKey != "sha256:byok_encrypted" &&
+		tags.EncryptionKey != "byok_encrypted" &&
+		tags.EncryptionKey != "managed_key"
+
+	var allData []byte
+	switch {
+	case hasPlatformKey:
+		key := platform.DeriveKey(tags.EncryptionKey)
+		for _, blob := range chunkBlobs {
+			plain, err := platform.DecryptChunk(key, blob)
+			if err != nil {
+				// Raw slice (unencrypted legacy) — pass through as-is.
+				allData = append(allData, blob...)
+				continue
+			}
+			allData = append(allData, plain...)
+		}
+	case fileMeta.Encrypted && f.squidfs.encryptor.IsEnabled():
+		blob := make([]byte, 0, 4096)
+		for _, b := range chunkBlobs {
+			blob = append(blob, b...)
+		}
+		decrypted, err := f.squidfs.encryptor.Decrypt(blob)
 		if err != nil {
 			return fmt.Errorf("decrypt: %w", err)
 		}
 		allData = decrypted
+	default:
+		for _, b := range chunkBlobs {
+			allData = append(allData, b...)
+		}
 	}
 
 	if err := f.squidfs.cache.Set(cacheKey, allData); err != nil {
@@ -321,8 +620,22 @@ func (f *File) download() error {
 	return nil
 }
 
+// uploadFrom streams the file to cluster storage using parallel chunk PUTs,
+// platform-compatible per-chunk envelopes, and a single metadata commit.
 func (f *File) upload() error {
 	data := f.data
+
+	// Platform interop: encrypt each chunk into the legacy-compatible
+	// res54 envelope with a per-file key the dashboard can resolve.
+	usePlatformCrypto := !f.squidfs.encryptor.IsEnabled()
+	var keyHex string
+	if usePlatformCrypto {
+		k, err := platform.GenerateKeyHex()
+		if err != nil {
+			return fmt.Errorf("generate key: %w", err)
+		}
+		keyHex = k
+	}
 
 	if f.squidfs.encryptor.IsEnabled() {
 		encrypted, err := f.squidfs.encryptor.Encrypt(data)
@@ -332,61 +645,101 @@ func (f *File) upload() error {
 		data = encrypted
 	}
 
-	chunksNeeded := (len(data) + 2*1024*1024 - 1) / (2 * 1024 * 1024)
+	chunksNeeded := (len(data) + platform.ChunkSize() - 1) / platform.ChunkSize()
 	if chunksNeeded == 0 {
 		chunksNeeded = 1
 	}
 
-	var chunkPaths []api.ChunkUploadRequest
+	chunkPaths := make([]api.ChunkUploadRequest, chunksNeeded)
 	for i := 0; i < chunksNeeded; i++ {
-		chunkPaths = append(chunkPaths, api.ChunkUploadRequest{
+		chunkPaths[i] = api.ChunkUploadRequest{
 			Path:  fmt.Sprintf("squidfs/%s/%s_%d.bin", time.Now().Format("20060102"), f.name, i),
 			Index: i,
-		})
+		}
 	}
 
-	urls, err := f.squidfs.client.GetUploadURLs(chunkPaths, int64(len(data)))
+	urlList, err := f.squidfs.client.GetUploadURLs(chunkPaths, int64(len(data)))
 	if err != nil {
 		return fmt.Errorf("get upload URLs: %w", err)
 	}
-
-	chunkSize := 2 * 1024 * 1024
-	for _, u := range urls {
-		start := u.Index * chunkSize
-		end := start + chunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-		chunk := data[start:end]
-
-		req, err := http.NewRequest("PUT", u.UploadURL, nil)
-		if err != nil {
-			return fmt.Errorf("create PUT request: %w", err)
-		}
-		req.Body = io.NopCloser(bytes.NewReader(chunk))
-		req.Header.Set("Content-Type", "application/octet-stream")
-		resp, err := f.squidfs.httpClient.Do(req)
-		if err != nil {
-			return fmt.Errorf("upload chunk %d: %w", u.Index, err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode >= 300 {
-			return fmt.Errorf("upload chunk %d failed: %d", u.Index, resp.StatusCode)
-		}
+	urlMap := make(map[int]api.UploadURLInfo, len(urlList))
+	for _, u := range urlList {
+		urlMap[u.Index] = u
 	}
 
-	chunkMetas := make([]api.ChunkMetadata, len(urls))
-	for _, u := range urls {
-		start := u.Index * chunkSize
-		end := start + chunkSize
-		if end > len(data) {
-			end = len(data)
+	// Prepare per-chunk slices (platform-sealed when applicable).
+	slices := make([][]byte, chunksNeeded)
+	key := platform.DeriveKey(keyHex)
+	for i := 0; i < chunksNeeded; i++ {
+		st := i * platform.ChunkSize()
+		en := st + platform.ChunkSize()
+		if en > len(data) {
+			en = len(data)
 		}
-		chunkMetas[u.Index] = api.ChunkMetadata{
-			Index:       u.Index,
-			TotalChunks: len(urls),
-			Size:        end - start,
-			Offset:      start,
+		sl := data[st:en]
+		if usePlatformCrypto {
+			sealed, serr := platform.EncryptChunk(key, sl)
+			if serr != nil {
+				return fmt.Errorf("encrypt chunk %d: %w", i, serr)
+			}
+			sl = sealed
+		}
+		slices[i] = sl
+	}
+
+	// Parallel PUT with bounded workers + retry.
+	var mu sync.Mutex
+	var firstErr error
+	sem := make(chan struct{}, stream.Workers)
+	var wg sync.WaitGroup
+	for i := 0; i < chunksNeeded; i++ {
+		i := i
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			u, ok := urlMap[i]
+			if !ok {
+				mu.Lock(); if firstErr == nil { firstErr = fmt.Errorf("no URL for chunk %d", i) }; mu.Unlock()
+				return
+			}
+			req, rerr := http.NewRequest(http.MethodPut, u.UploadURL, bytes.NewReader(slices[i]))
+			if rerr != nil {
+				mu.Lock(); if firstErr == nil { firstErr = rerr }; mu.Unlock()
+				return
+			}
+			req.Header.Set("Content-Type", "application/octet-stream")
+			resp, derr := f.squidfs.httpClient.Do(req)
+			if derr != nil {
+				mu.Lock(); if firstErr == nil { firstErr = derr }; mu.Unlock()
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode >= 300 {
+				mu.Lock(); if firstErr == nil { firstErr = fmt.Errorf("chunk %d HTTP %d", i, resp.StatusCode) }; mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+
+	chunkMetas := make([]api.ChunkMetadata, chunksNeeded)
+	for i := 0; i < chunksNeeded; i++ {
+		st := i * platform.ChunkSize()
+		en := st + platform.ChunkSize()
+		if en > len(data) {
+			en = len(data)
+		}
+		u := urlMap[i]
+		chunkMetas[i] = api.ChunkMetadata{
+			Index:       i,
+			TotalChunks: chunksNeeded,
+			Size:        en - st,
+			Offset:      st,
 			Path:        u.Path,
 			Bucket:      u.Bucket,
 			ClusterID:   u.ClusterID,
@@ -394,21 +747,24 @@ func (f *File) upload() error {
 	}
 
 	tags := api.FileTags{
-		FileName: f.name,
-		FileType: "application/octet-stream",
-		FileSize: int64(len(data)),
-		Chunks:   chunkMetas,
+		FileName:      f.name,
+		FileType:      api.MimeTypeFor(f.name),
+		FileSize:      int64(len(f.data)),
+		EncryptionKey: keyHex,
+		Created:       time.Now().UTC().Format(time.RFC3339),
+		Chunks:        chunkMetas,
 	}
 	tagsJSON, _ := json.Marshal(tags)
 	tagsArray, _ := json.Marshal([]json.RawMessage{tagsJSON})
 
 	fileRecord := api.UploadFileRecord{
 		Name:         f.name,
-		Type:         "application/octet-stream",
-		Size:         int64(len(data)),
+		Type:         api.MimeTypeFor(f.name),
+		Size:         int64(len(f.data)),
 		StoragePath:  "res54_distributed",
-		MimeType:     "application/octet-stream",
-		Encrypted:    f.squidfs.encryptor.IsEnabled(),
+		MimeType:     api.MimeTypeFor(f.name),
+		Encrypted:    usePlatformCrypto || f.squidfs.encryptor.IsEnabled(),
+		EncryptionKey: map[bool]string{true: "sha256:byok_encrypted"}[f.squidfs.encryptor.IsEnabled()],
 		ParentFolder: f.path,
 		Tags:         tagsArray,
 	}

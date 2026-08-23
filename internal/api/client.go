@@ -1,6 +1,8 @@
 package api
 
 import (
+	"strings"
+	"path/filepath"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -78,10 +80,40 @@ type ChunkMetadata struct {
 }
 
 type FileTags struct {
-	FileName string          `json:"fileName"`
-	FileType string          `json:"fileType"`
-	FileSize int64           `json:"fileSize"`
-	Chunks   []ChunkMetadata `json:"chunks"`
+	FileName      string          `json:"fileName"`
+	FileType      string          `json:"fileType"`
+	FileSize      int64           `json:"fileSize"`
+	EncryptionKey string          `json:"encryptionKey,omitempty"`
+	Created       string          `json:"created,omitempty"`
+	Chunks        []ChunkMetadata `json:"chunks"`
+}
+
+// MimeTypeFor returns a mime type from a filename extension, defaulting to
+// application/octet-stream. Shared by FUSE and WebDAV write paths so records
+// stored in SquidCloud carry the real type instead of octet-stream.
+func MimeTypeFor(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	if ct, ok := mimeTypes[ext]; ok {
+		return ct
+	}
+	return "application/octet-stream"
+}
+
+var mimeTypes = map[string]string{
+	".txt": "text/plain", ".md": "text/markdown", ".html": "text/html", ".htm": "text/html",
+	".css": "text/css", ".js": "application/javascript", ".ts": "application/typescript",
+	".json": "application/json", ".xml": "application/xml", ".yml": "application/x-yaml",
+	".yaml": "application/x-yaml", ".toml": "application/toml", ".csv": "text/csv",
+	".pdf": "application/pdf", ".zip": "application/zip", ".gz": "application/gzip",
+	".tar": "application/x-tar", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+	".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".ico": "image/x-icon",
+	".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".flac": "audio/flac",
+	".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".mkv": "video/x-matroska",
+	".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".go": "text/x-go", ".py": "text/x-python", ".rs": "text/rust", ".sh": "text/x-shellscript",
+	".sql": "application/sql", ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf",
 }
 
 func NewClient(bridgeURL, apiKey string) *Client {

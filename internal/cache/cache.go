@@ -65,6 +65,12 @@ func (c *Cache) loadExisting() error {
 	})
 }
 
+// Has reports whether a fresh entry exists for key.
+func (c *Cache) Has(key string) bool {
+	_, ok := c.Get(key)
+	return ok
+}
+
 func (c *Cache) Get(key string) ([]byte, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

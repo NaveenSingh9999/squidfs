@@ -55,7 +55,8 @@ func main() {
 	log.Printf("Bridge: %s", bridgeURL)
 
 	client := api.NewClient(bridgeURL, apiKey)
-	diskCache, err := cache.NewCache("", 500*1024*1024)
+	cacheDir := os.Getenv("HOME") + "/.squidfs/cache"
+	diskCache, err := cache.NewCache(cacheDir, 500*1024*1024)
 	if err != nil {
 		log.Printf("Cache init failed: %v (continuing without cache)", err)
 	}
