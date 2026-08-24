@@ -645,7 +645,7 @@ func (f *File) upload() error {
 		data = encrypted
 	}
 
-	chunksNeeded := (len(data) + platform.ChunkSize() - 1) / platform.ChunkSize()
+	chunksNeeded := (len(data) + platform.ChunkSize - 1) / platform.ChunkSize
 	if chunksNeeded == 0 {
 		chunksNeeded = 1
 	}
@@ -671,8 +671,8 @@ func (f *File) upload() error {
 	slices := make([][]byte, chunksNeeded)
 	key := platform.DeriveKey(keyHex)
 	for i := 0; i < chunksNeeded; i++ {
-		st := i * platform.ChunkSize()
-		en := st + platform.ChunkSize()
+		st := i * platform.ChunkSize
+		en := st + platform.ChunkSize
 		if en > len(data) {
 			en = len(data)
 		}
@@ -729,8 +729,8 @@ func (f *File) upload() error {
 
 	chunkMetas := make([]api.ChunkMetadata, chunksNeeded)
 	for i := 0; i < chunksNeeded; i++ {
-		st := i * platform.ChunkSize()
-		en := st + platform.ChunkSize()
+		st := i * platform.ChunkSize
+		en := st + platform.ChunkSize
 		if en > len(data) {
 			en = len(data)
 		}

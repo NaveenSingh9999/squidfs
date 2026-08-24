@@ -79,6 +79,11 @@ func main() {
 
 	if webdavMode {
 		server := webdav.NewServer(client, diskCache, encryptor, port)
+		server.SetAuth(os.Getenv("SQUIDCLOUD_AUTH_TOKEN"), os.Getenv("SQUIDCLOUD_ANON_KEY"))
+		if durl := os.Getenv("SQUIDCLOUD_DECRYPTOR"); durl != "" {
+			server.SetDecryptor(durl, os.Getenv("SQUIDCLOUD_DECRYPTOR_AUTH"))
+			log.Printf("Decryptor: %s", durl)
+		}
 		go func() {
 			<-sigChan
 			server.Stop()

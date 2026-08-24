@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
 	"path/filepath"
@@ -30,6 +31,10 @@ import (
 )
 
 type WebDAVServer struct {
+	apiToken      string
+	anonKey       string
+	decryptorURL  string
+	decryptorAuth string
 	listCache map[string][]os.FileInfo
 	listTime  map[string]time.Time
 	listMu    sync.Mutex
@@ -99,6 +104,19 @@ func NewServer(client *api.Client, cache *cache.Cache, encryptor *encryption.Enc
 	}
 }
 
+func (s *WebDAVServer) SetAuth(token, anon string) {
+	s.apiToken = token
+	s.anonKey = anon
+}
+
+// SetDecryptor wires the local decryption daemon (reserved port 6763).
+// When set, every content read is proxied through it and the Go binary
+// never touches crypto itself.
+func (s *WebDAVServer) SetDecryptor(url, auth string) {
+	s.decryptorURL = url
+	s.decryptorAuth = auth
+}
+
 func (s *WebDAVServer) registerMDNS() error {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
@@ -152,39 +170,37 @@ func (s *WebDAVServer) Start() error {
 			}
 
 			rangeHdr := r.Header.Get("Range")
-			var start, length int64
-			hasRange := false
-			if rangeHdr != "" && fi != nil {
-				if parsed, ok := parseByteRange(rangeHdr, fi.Size); ok {
-					start, length = parsed.start, parsed.length
-					hasRange = true
-				}
-			}
 
-			var data []byte
-			if hasRange && fi.StoragePath == "res54_distributed" {
-				data, err = s.readRangeLazy(fi, start, length)
-				if err != nil {
-					log.Printf("GET %s range error: %v", name, err)
-					http.Error(w, "range read failed", http.StatusInternalServerError)
+			// For res54 files: always proxy through SquidCloud REST API which
+			// handles all crypto server-side.
+			if fi != nil && fi.StoragePath == "res54_distributed" {
+				full, cliErr := s.downloadFileBytes(fi.ID)
+				if cliErr != nil {
+					log.Printf("GET %s error: %v", name, cliErr)
+					http.Error(w, "download failed", 500)
 					return
 				}
 				ct := mimeTypes[path.Ext(name)]
-				if ct == "" { ct = "application/octet-stream" }
 				w.Header().Set("Content-Type", ct)
+				w.Header().Set("Accept-Ranges", "bytes")
+
+				status := 200
+				data := full
+				if rangeHdr != "" {
+					if br, ok := parseByteRange(rangeHdr, int64(len(full))); ok {
+						data = full[br.start : br.start+br.length]
+						w.Header().Set("Content-Range",
+							fmt.Sprintf("bytes %d-%d/%d", br.start, br.start+br.length-1, len(full)))
+						status = 206
+					}
+				}
 				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+int64(len(data))-1, fi.Size))
-				w.WriteHeader(http.StatusPartialContent)
+				w.WriteHeader(status)
 				if r.Method == "GET" { w.Write(data) }
 				return
 			}
 
-			data, err = s.downloadFile(name)
-			if err != nil {
-				log.Printf("GET %s error: %v", name, err)
-				http.NotFound(w, r)
-				return
-			}
+			var data []byte
 			ct := mimeTypes[path.Ext(name)]
 			if ct == "" {
 				ct = "application/octet-stream"
@@ -490,149 +506,86 @@ func (s *WebDAVServer) listDir(dirPath string) ([]os.FileInfo, error) {
 	return entries, nil
 }
 
-func (s *WebDAVServer) downloadFile(name string) ([]byte, error) {
+// lookupMeta resolves a WebDAV path to its FileMetadata.
+func (s *WebDAVServer) lookupMeta(name string) *api.FileMetadata {
 	s.mu.RLock()
-	fi, ok := s.fileInfo[name]
-	s.mu.RUnlock()
-	if !ok {
-		parentDir := path.Dir(name)
-		if parentDir == "." {
-			parentDir = ""
-		}
-		if _, err := s.listDir(parentDir); err != nil {
-			return nil, fmt.Errorf("list parent: %w", err)
-		}
-		s.mu.RLock()
-		fi, ok = s.fileInfo[name]
-		s.mu.RUnlock()
-		if !ok {
-			return nil, os.ErrNotExist
-		}
+	defer s.mu.RUnlock()
+	if fi, ok := s.fileInfo[name]; ok {
+		return fi
 	}
-
-	if fi.StoragePath != "res54_distributed" {
-		return nil, fmt.Errorf("unsupported storage: %s", fi.StoragePath)
-	}
-
-	return s.downloadRes54(fi)
+	return nil
 }
 
-func (s *WebDAVServer) downloadRes54(fi *api.FileMetadata) ([]byte, error) {
-	cacheKey := cache.CacheKey(fi.ID, 0)
+// downloadFileBytes fetches decrypted plaintext. Primary path: the local
+// decryptor daemon on reserved port 6763 (exact web-frontend crypto chain,
+// no rate limits, no server round-trip for keys). Fallback: the platform
+// REST API's server-side decrypt endpoint.
+func (s *WebDAVServer) downloadFileBytes(fileID string) ([]byte, error) {
+	cacheKey := cache.CacheKey(fileID, 0)
 	if s.cache != nil {
 		if data, ok := s.cache.Get(cacheKey); ok {
 			return data, nil
 		}
 	}
-
-	var tags api.FileTags
-	if fi.Tags != nil {
-		tagsRaw := fi.Tags
-		// Tags may be ["{json_string}"] — array with stringified JSON
-		if len(fi.Tags) > 0 && fi.Tags[0] == '[' {
-			var arr []json.RawMessage
-			if err := json.Unmarshal(fi.Tags, &arr); err == nil && len(arr) > 0 {
-				tagsRaw = arr[0]
-				// If arr[0] is a string, unwrap it
-				var s string
-				if err := json.Unmarshal(tagsRaw, &s); err == nil {
-					tagsRaw = []byte(s)
-				}
-			}
-		}
-		// Or it might be a bare JSON string "{...}"
-		if len(tagsRaw) > 0 && tagsRaw[0] == '"' {
-			var s string
-			if err := json.Unmarshal(tagsRaw, &s); err == nil {
-				tagsRaw = []byte(s)
-			}
-		}
-		if err := json.Unmarshal(tagsRaw, &tags); err != nil {
-			return nil, fmt.Errorf("parse tags: %w", err)
-		}
-	}
-
-	if len(tags.Chunks) == 0 {
-		return nil, fmt.Errorf("no chunks found")
-	}
-
-	var downloadChunks []api.DownloadChunkRequest
-	for _, c := range tags.Chunks {
-		downloadChunks = append(downloadChunks, api.DownloadChunkRequest{
-			Path:   c.Path,
-			Index:  c.Index,
-			Bucket: c.Bucket,
-		})
-	}
-
-	urls, err := s.client.ResolveDownloadURLs(downloadChunks)
+	data, err := s.fetchDecrypted(fileID)
 	if err != nil {
-		return nil, fmt.Errorf("resolve download URLs: %w", err)
+		return nil, err
 	}
-
-	urlMap := make(map[int]string)
-	for _, u := range urls {
-		urlMap[u.Index] = u.DownloadURL
-	}
-
-	chunkBlobs := make([][]byte, 0, len(tags.Chunks))
-	for _, c := range tags.Chunks {
-		downloadURL, ok := urlMap[c.Index]
-		if !ok {
-			return nil, fmt.Errorf("missing URL for chunk %d", c.Index)
-		}
-		resp, err := s.httpClient.Get(downloadURL)
-		if err != nil {
-			return nil, fmt.Errorf("download chunk %d: %w", c.Index, err)
-		}
-		chunkData, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("read chunk %d: %w", c.Index, err)
-		}
-		chunkBlobs = append(chunkBlobs, chunkData)
-	}
-
-	hasPlatformKey := tags.EncryptionKey != "" &&
-		tags.EncryptionKey != "sha256:byok_encrypted" &&
-		tags.EncryptionKey != "byok_encrypted" &&
-		tags.EncryptionKey != "managed_key"
-
-	var allData []byte
-	switch {
-	case hasPlatformKey:
-		key := platform.DeriveKey(tags.EncryptionKey)
-		for _, blob := range chunkBlobs {
-			plain, err := platform.DecryptChunk(key, blob)
-			if err != nil {
-				allData = append(allData, blob...)
-				continue
-			}
-			allData = append(allData, plain...)
-		}
-	case s.encryptor != nil && s.encryptor.IsEnabled() && fi.Encrypted:
-		blob := make([]byte, 0, 4096)
-		for _, b := range chunkBlobs {
-			blob = append(blob, b...)
-		}
-		decrypted, err := s.encryptor.Decrypt(blob)
-		if err != nil {
-			return nil, fmt.Errorf("decrypt: %w", err)
-		}
-		allData = decrypted
-	default:
-		for _, b := range chunkBlobs {
-			allData = append(allData, b...)
-		}
-	}
-
 	if s.cache != nil {
-		if err := s.cache.Set(cacheKey, allData); err != nil {
-			log.Printf("Cache write failed: %v", err)
+		s.cache.Set(cacheKey, data)
+	}
+	return data, nil
+}
+
+func (s *WebDAVServer) fetchDecrypted(fileID string) ([]byte, error) {
+	if s.decryptorURL != "" {
+		req, err := http.NewRequest("GET", strings.TrimRight(s.decryptorURL, "/")+"/file/"+fileID, nil)
+		if err == nil {
+			if s.decryptorAuth != "" {
+				req.Header.Set("X-SquidFS-Auth", s.decryptorAuth)
+			}
+			resp, derr := s.httpClient.Do(req)
+			if derr == nil {
+				data, rerr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if rerr == nil && resp.StatusCode < 300 {
+					return data, nil
+				}
+				if rerr == nil {
+					log.Printf("[decryptor] %s: HTTP %d — falling back to API", fileID[:min(8, len(fileID))], resp.StatusCode)
+				}
+			} else {
+				log.Printf("[decryptor] unreachable (%v) — falling back to API", derr)
+			}
 		}
 	}
 
-	return allData, nil
+	url := fmt.Sprintf("https://squidcloud.vercel.app/api/v1/download/%s", fileID)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil { return nil, err }
+	req.Header.Set("Authorization", "Bearer "+s.apiToken)
+	if s.anonKey != "" {
+		req.Header.Set("apikey", s.anonKey)
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil { return nil, fmt.Errorf("download request: %w", err) }
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil { return nil, fmt.Errorf("read response: %w", err) }
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("download failed: HTTP %d: %s", resp.StatusCode, string(data[:min(len(data), 200)]))
+	}
+	return data, nil
+}
+
+// downloadFile proxies through SquidCloud's REST API which handles all
+// decryption server-side. Returns fully decrypted plaintext bytes.
+func (s *WebDAVServer) downloadFile(name string) ([]byte, error) {
+	fi := s.lookupMeta(name)
+	if fi == nil {
+		return nil, os.ErrNotExist
+	}
+	return s.downloadFileBytes(fi.ID)
 }
 
 type WebDAVDir struct {
@@ -737,118 +690,6 @@ func parseByteRange(h string, total int64) (byteRange, bool) {
 }
 
 // readRangeLazy fetches and decrypts only the chunks covering [start,len).
-func (s *WebDAVServer) readRangeLazy(fi *api.FileMetadata, start, length int64) ([]byte, error) {
-	if length <= 0 { return []byte{}, nil }
-	if start+length > fi.Size { length = fi.Size - start }
-
-	var tags api.FileTags
-	tagsRaw := fi.Tags
-	if len(tagsRaw) > 0 && tagsRaw[0] == '[' {
-		var arr []json.RawMessage
-		if err := json.Unmarshal(tagsRaw, &arr); err == nil && len(arr) > 0 {
-			tagsRaw = arr[0]
-			var str string
-			if err := json.Unmarshal(tagsRaw, &str); err == nil { tagsRaw = []byte(str) }
-		}
-	} else if len(tagsRaw) > 0 && tagsRaw[0] == '"' {
-		var str string
-		if err := json.Unmarshal(tagsRaw, &str); err == nil { tagsRaw = []byte(str) }
-	}
-	if err := json.Unmarshal(tagsRaw, &tags); err != nil {
-		return nil, fmt.Errorf("parse tags: %w", err)
-	}
-
-	keyRaw := platform.DeriveKey(tags.EncryptionKey)
-
-	idx := stream.ChunksCovering(start, length)
-
-	// Serve cached chunks immediately; collect misses for parallel fetch.
-	parts := make([][]byte, len(idx))
-	var missIdx []int
-	for j, ci := range idx {
-		var ck string
-		if s.cache != nil {
-			ck = cache.CacheKey(fi.ID, ci)
-			if d, ok := s.cache.Get(ck); ok {
-			parts[j] = sliceChunk(d, start, length, ci)
-			continue
-		}
-		}
-		missIdx = append(missIdx, ci)
-	}
-
-	if len(missIdx) > 0 {
-		reqs := make([]api.DownloadChunkRequest, len(missIdx))
-		for j, ci := range missIdx {
-			reqs[j] = api.DownloadChunkRequest{
-				Path: tags.Chunks[ci].Path, Index: ci, Bucket: tags.Chunks[ci].Bucket,
-			}
-		}
-		resolved, err := s.client.ResolveDownloadURLs(reqs)
-		if err != nil {
-			return nil, fmt.Errorf("resolve: %w", err)
-		}
-		umap := make(map[int]string, len(resolved))
-		for _, u := range resolved {
-			umap[u.Index] = u.DownloadURL
-		}
-
-		fetched := make([][]byte, len(missIdx))
-		var fetchMu sync.Mutex
-		errFetch := stream.FetchChunksParallel(s.httpClient, umap, missIdx, func(i int, blob []byte) {
-			var plain []byte
-			if hasPlatformKey(tags) {
-				if p, derr := platform.DecryptChunk(platform.DeriveKey(tags.EncryptionKey), blob); derr == nil {
-					plain = p
-				} else {
-					plain = blob
-				}
-			} else if s.encryptor != nil && s.encryptor.IsEnabled() && fi.Encrypted {
-				if p, derr := s.encryptor.Decrypt(blob); derr == nil {
-					plain = p
-				} else {
-					plain = blob
-				}
-			} else {
-				plain = blob
-			}
-			s.cache.Set(cache.CacheKey(fi.ID, i), plain)
-			fetchMu.Lock()
-			for j, ci := range missIdx {
-				if ci == i {
-					fetched[j] = plain
-					break
-				}
-			}
-			fetchMu.Unlock()
-		})
-		if errFetch != nil {
-			return nil, errFetch
-		}
-
-		fj := 0
-		for j, ci := range idx {
-			if parts[j] == nil && fj < len(missIdx) && missIdx[fj] == ci {
-				parts[j] = fetched[fj]
-				fj++
-			}
-		}
-	}
-
-	_ = keyRaw
-
-	out := make([]byte, 0, length)
-	for _, p := range parts {
-		if p == nil {
-			continue
-		}
-		out = append(out, p...)
-	}
-	if max := fi.Size - start; int64(len(out)) > max && max >= 0 {
-		out = out[:max]
-	}
-	return out, nil
-}
 
 func sliceChunk(chunk []byte, off, total int64, idx int) []byte {
 	cs := int64(stream.ChunkSize)
@@ -865,6 +706,66 @@ func hasPlatformKey(t api.FileTags) bool {
 	k := t.EncryptionKey
 	return k != "" && k != "managed_key" && k != "sha256:byok_encrypted" &&
 		k != "byok_encrypted" && k != "byok_protected"
+}
+
+
+// downloadViaAPI proxies through SquidCloud's download API which handles
+// all decryption server-side. Returns fully decrypted plaintext.
+func (s *WebDAVServer) downloadViaAPI(fi *api.FileMetadata) ([]byte, error) {
+	url := fmt.Sprintf("https://squidcloud.vercel.app/api/v1/download/%s", fi.ID)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil { return nil, err }
+	req.Header.Set("Authorization", "Bearer "+s.apiToken)
+	if s.anonKey != "" { req.Header.Set("apikey", s.anonKey) }
+	resp, err := s.httpClient.Do(req)
+	if err != nil { return nil, fmt.Errorf("download: %w", err) }
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil { return nil, fmt.Errorf("read response: %w", err) }
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("download failed: HTTP %d: %s", resp.StatusCode, string(data[:min(120,len(data))]))
+	}
+	return data, nil
+}
+
+
+// downloadViaCLI spawns squidcloudctl storage dl to get fully decrypted content.
+func (s *WebDAVServer) downloadViaCLI(fi *api.FileMetadata) ([]byte, error) {
+	cliBin := os.Getenv("SQUIDCLOUDCTL_BIN")
+	if cliBin == "" {
+		for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+			p := filepath.Join(dir, "squidcloudctl")
+			if _, err := os.Stat(p); err == nil { cliBin = p; break }
+		}
+	}
+	if cliBin == "" {
+		cliBin = os.Getenv("HOME") + "/.squidcloud/bin/squidcloudctl"
+		if _, err := os.Stat(cliBin); err != nil {
+			return nil, fmt.Errorf("squidcloudctl not found in PATH or ~/.squidcloud/bin")
+		}
+	}
+
+	tmpFile := fmt.Sprintf("/tmp/squidfs-dl-%d", time.Now().UnixNano())
+	defer os.Remove(tmpFile)
+
+	cmd := exec.Command(cliBin, "storage", "dl", fi.ID, "-o", tmpFile)
+	cmd.Env = append(os.Environ(),
+		"SQUIDCLOUD_NONINTERACTIVE=1",
+		"SQUIDFS_DECRYPT_PORT=8066",
+	)
+	
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("CLI: %v: %s", err, stderr.String()[:min(200, stderr.Len())])
+	}
+
+	// CLI saves the file with its original name in cwd
+	data, err := os.ReadFile(tmpFile)
+	if err != nil {
+		return nil, fmt.Errorf("read output: %w", err)
+	}
+	return data, nil
 }
 
 
@@ -903,7 +804,7 @@ func (f *WebDAVFile) Close() error {
 
 	log.Printf("Upload %s (%d bytes)", f.name, len(f.data))
 
-	chunksNeeded := (len(f.data) + platform.ChunkSize() - 1) / platform.ChunkSize()
+	chunksNeeded := (len(f.data) + platform.ChunkSize - 1) / platform.ChunkSize
 	if chunksNeeded == 0 {
 		chunksNeeded = 1
 	}
@@ -931,7 +832,7 @@ func (f *WebDAVFile) Close() error {
 	}
 
 	key := platform.DeriveKey(keyHex)
-	chunkSize := platform.ChunkSize()
+	chunkSize := platform.ChunkSize
 
 	var mu sync.Mutex
 	var firstErr error
@@ -1028,22 +929,18 @@ func (f *WebDAVFile) Close() error {
 }
 
 
-const lazyReadThreshold = 8 * 1024 * 1024 // >8MB → chunk-streamed
+const lazyReadThreshold = 8 * 1024 * 1024 // >8MB → full API download + slice
 
 func (f *WebDAVFile) Read(p []byte) (n int, err error) {
-	// Large read-only files: pull only the chunks covering [offset, offset+len)
-	if f.written == false && f.existing != nil && f.existing.Size > lazyReadThreshold && f.offset < f.existing.Size {
-		want := int64(len(p))
-		data, rerr := f.server.readRangeLazy(f.existing, f.offset, want)
+	// Large read-only files: fetch once via API (server decrypts), serve from memory.
+	if !f.written && f.existing != nil && f.existing.Size > lazyReadThreshold && f.offset < f.existing.Size {
+		full, rerr := f.server.downloadFileBytes(f.existing.ID)
 		if rerr != nil {
 			return 0, rerr
 		}
-		n = copy(p, data)
-		f.offset += int64(n)
-		if n == 0 {
-			return 0, io.EOF
+		if f.data == nil {
+			f.data = full
 		}
-		return n, nil
 	}
 
 	if f.data == nil {

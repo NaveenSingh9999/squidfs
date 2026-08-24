@@ -24,6 +24,7 @@ type Client struct {
 
 type BridgeResponse struct {
 	Success bool            `json:"success"`
+	Key     string          `json:"key,omitempty"`
 	Error   string          `json:"error,omitempty"`
 	Files   []FileMetadata  `json:"files,omitempty"`
 	Folders []FolderMetadata `json:"folders,omitempty"`
@@ -63,6 +64,7 @@ type UploadURLInfo struct {
 	Index     int    `json:"index"`
 	UploadURL string `json:"uploadUrl"`
 	DownloadURL string `json:"downloadUrl,omitempty"`
+	Key string `json:"key,omitempty"`
 	ClusterID string `json:"clusterId"`
 	Bucket    string `json:"bucket"`
 }
@@ -337,4 +339,12 @@ type UploadFileRecord struct {
 func ComputeSHA256(data []byte) []byte {
 	h := sha256.Sum256(data)
 	return h[:]
+}
+
+func (c *Client) GetFileKey(fileID string) (string, error) {
+	result, err := c.callBridge("file_key", map[string]interface{}{"file_id": fileID})
+	if err != nil {
+		return "", err
+	}
+	return result.Key, nil
 }
