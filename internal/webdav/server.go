@@ -4,6 +4,11 @@ import (
 	"strconv"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,6 +40,9 @@ type WebDAVServer struct {
 	anonKey       string
 	decryptorURL  string
 	decryptorAuth string
+	authHash      *pbkdf2Hash // WebDAV password verifier (PBKDF2-SHA256); nil = no auth
+	bindHost      string
+	mdnsEnabled   bool
 	listCache map[string][]os.FileInfo
 	listTime  map[string]time.Time
 	listMu    sync.Mutex
@@ -117,6 +125,78 @@ func (s *WebDAVServer) SetDecryptor(url, auth string) {
 	s.decryptorAuth = auth
 }
 
+// SetWebdavAuthHash enables HTTP Basic authentication against a PBKDF2-SHA256
+// hash file. Every method on every path requires valid credentials.
+func (s *WebDAVServer) SetWebdavAuthHash(hash *pbkdf2Hash) { s.authHash = hash }
+
+// SetBindHost restricts the listener (default: loopback only).
+func (s *WebDAVServer) SetBindHost(host string) { s.bindHost = host }
+
+// SetMdnsEnabled gates LAN advertisement (default off).
+func (s *WebDAVServer) SetMdnsEnabled(on bool) { s.mdnsEnabled = on }
+
+// ── PBKDF2-SHA256 password verifier (stdlib-only; matches CLI format) ──
+
+type pbkdf2Hash struct {
+	salt   []byte
+	iters  int
+	hash   []byte
+}
+
+// parsePbkdf2HashFile reads "pbkdf2$sha256$<iters>$<saltB64>$<hashB64>".
+func ParsePbkdf2HashFile(path string) (*pbkdf2Hash, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(strings.TrimSpace(string(raw)), "$")
+	if len(parts) != 5 || parts[0] != "pbkdf2" || parts[1] != "sha256" {
+		return nil, fmt.Errorf("unsupported hash file format")
+	}
+	iters, err := strconv.Atoi(parts[2])
+	if err != nil || iters < 10000 {
+		return nil, fmt.Errorf("bad iteration count")
+	}
+	salt, err := base64.StdEncoding.DecodeString(parts[3])
+	if err != nil {
+		return nil, err
+	}
+	hash, err := base64.StdEncoding.DecodeString(parts[4])
+	if err != nil {
+		return nil, err
+	}
+	return &pbkdf2Hash{salt: salt, iters: iters, hash: hash}, nil
+}
+
+func pbkdf2Sha256(password, salt []byte, iters, keyLen int) []byte {
+	prf := hmac.New(sha256.New, password)
+	numBlocks := (keyLen + sha256.Size - 1) / sha256.Size
+	var out []byte
+	for block := 1; block <= numBlocks; block++ {
+		prf.Reset()
+		prf.Write(salt)
+		binary.Write(prf, binary.BigEndian, uint32(block))
+		u := prf.Sum(nil)
+		t := make([]byte, len(u))
+		copy(t, u)
+		for i := 1; i < iters; i++ {
+			prf.Reset()
+			prf.Write(u)
+			u = prf.Sum(nil)
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		out = append(out, t...)
+	}
+	return out[:keyLen]
+}
+
+func (h *pbkdf2Hash) verify(password string) bool {
+	candidate := pbkdf2Sha256([]byte(password), h.salt, h.iters, len(h.hash))
+	return subtle.ConstantTimeCompare(candidate, h.hash) == 1
+}
+
 func (s *WebDAVServer) registerMDNS() error {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
@@ -154,7 +234,30 @@ func (s *WebDAVServer) Start() error {
 		},
 	}
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Loopback by default; a non-loopback bind without password auth is
+	// refused at startup by cmd/squidfs (defense in depth).
+	bindHost := s.bindHost
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+
+	// HTTP Basic auth gate — enforced for EVERY method when a password is set.
+	authGate := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if s.authHash != nil {
+				user, pass, ok := r.BasicAuth()
+				_ = user // single-tenant: the password is the secret, not the username
+				if !ok || !s.authHash.verify(pass) {
+					w.Header().Set("WWW-Authenticate", `Basic realm="SquidFS"`)
+					http.Error(w, "unauthorized", 401)
+					return
+				}
+			}
+			next(w, r)
+		}
+	}
+
+	handler := authGate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" || r.Method == "HEAD" {
 			name := strings.TrimPrefix(r.URL.Path, "/")
 			name = strings.TrimSuffix(name, "/")
@@ -209,16 +312,18 @@ func (s *WebDAVServer) Start() error {
 		}
 		sw := &stripErrorWriter{ResponseWriter: w}
 		s.handler.ServeHTTP(sw, r)
-	})
+	}))
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.port))
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindHost, s.port))
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
 	s.listener = listener
 
-	if err := s.registerMDNS(); err != nil {
-		log.Printf("mDNS failed (non-fatal): %v", err)
+	if s.mdnsEnabled {
+		if err := s.registerMDNS(); err != nil {
+			log.Printf("mDNS failed (non-fatal): %v", err)
+		}
 	}
 
 	sigChan := make(chan os.Signal, 1)

@@ -25,6 +25,9 @@ func main() {
 		password   string
 		userID     string
 		mountPoint string
+		bindHost   string
+		authHash   string
+		mdns       bool
 		showVer    bool
 	)
 
@@ -35,6 +38,9 @@ func main() {
 	flag.StringVar(&password, "password", "", "Encryption password (optional)")
 	flag.StringVar(&userID, "user", "", "User ID for encryption (optional)")
 	flag.StringVar(&mountPoint, "mount", "/mnt/squidfs", "FUSE mount point")
+	flag.StringVar(&bindHost, "bind", "", "Bind address (default 127.0.0.1 — loopback only)")
+	flag.StringVar(&authHash, "auth-hash", "", "PBKDF2 hash file enabling WebDAV Basic auth (env SQUIDCLOUD_WEBDAV_AUTH_HASH)")
+	flag.BoolVar(&mdns, "mdns", false, "Advertise via mDNS on the LAN (off by default)")
 	flag.BoolVar(&showVer, "version", false, "Show version")
 
 	flag.Parse()
@@ -78,8 +84,35 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	if webdavMode {
+		// Fail closed: a non-loopback bind without password auth would expose
+		// every decrypted file to the network.
+		effectiveBind := bindHost
+		if effectiveBind == "" {
+			effectiveBind = "127.0.0.1"
+		}
+		hashPath := authHash
+		if hashPath == "" {
+			hashPath = os.Getenv("SQUIDCLOUD_WEBDAV_AUTH_HASH")
+		}
+		isLoopback := effectiveBind == "127.0.0.1" || effectiveBind == "localhost" || effectiveBind == "::1"
+		if !isLoopback && hashPath == "" {
+			log.Fatal("refusing to bind non-loopback without --auth-hash (WebDAV password auth is mandatory for remote access)")
+		}
+
 		server := webdav.NewServer(client, diskCache, encryptor, port)
 		server.SetAuth(os.Getenv("SQUIDCLOUD_AUTH_TOKEN"), os.Getenv("SQUIDCLOUD_ANON_KEY"))
+		server.SetBindHost(effectiveBind)
+		server.SetMdnsEnabled(mdns && !isLoopback)
+		if hashPath != "" {
+			h, err := webdav.ParsePbkdf2HashFile(hashPath)
+			if err != nil {
+				log.Fatalf("WebDAV auth hash: %v", err)
+			}
+			server.SetWebdavAuthHash(h)
+			log.Println("WebDAV password auth: enabled")
+		} else {
+			log.Println("WebDAV password auth: none (loopback-only bind)")
+		}
 		if durl := os.Getenv("SQUIDCLOUD_DECRYPTOR"); durl != "" {
 			server.SetDecryptor(durl, os.Getenv("SQUIDCLOUD_DECRYPTOR_AUTH"))
 			log.Printf("Decryptor: %s", durl)
