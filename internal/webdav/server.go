@@ -149,7 +149,7 @@ func (s *WebDAVServer) Start() error {
 		LockSystem: webdav.NewMemLS(),
 		Logger: func(r *http.Request, err error) {
 			if err != nil {
-				log.Printf("WebDAV error: %v", err)
+				log.Printf("WebDAV error: %s %s: %v", r.Method, r.URL.Path, err)
 			}
 		},
 	}
