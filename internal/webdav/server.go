@@ -171,16 +171,20 @@ func (s *WebDAVServer) Start() error {
 
 			rangeHdr := r.Header.Get("Range")
 
-			// For res54 files: always proxy through SquidCloud REST API which
-			// handles all crypto server-side.
-			if fi != nil && fi.StoragePath == "res54_distributed" {
-				full, cliErr := s.downloadFileBytes(fi.ID)
+			// All SquidFS files are remote and end-to-end encrypted: always
+			// proxy through the decryptor daemon (or platform fallback), which
+			// returns fully decrypted plaintext for any storage backend.
+			if fi != nil {
+				full, cliErr := s.downloadFile(name)
 				if cliErr != nil {
 					log.Printf("GET %s error: %v", name, cliErr)
 					http.Error(w, "download failed", 500)
 					return
 				}
 				ct := mimeTypes[path.Ext(name)]
+				if ct == "" {
+					ct = "application/octet-stream"
+				}
 				w.Header().Set("Content-Type", ct)
 				w.Header().Set("Accept-Ranges", "bytes")
 
@@ -199,19 +203,6 @@ func (s *WebDAVServer) Start() error {
 				if r.Method == "GET" { w.Write(data) }
 				return
 			}
-
-			var data []byte
-			ct := mimeTypes[path.Ext(name)]
-			if ct == "" {
-				ct = "application/octet-stream"
-			}
-			w.Header().Set("Content-Type", ct)
-			w.Header().Set("Accept-Ranges", "bytes")
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-			if r.Method == "GET" {
-				w.Write(data)
-			}
-			return
 		}
 		if r.Method == "PROPFIND" {
 			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
