@@ -542,12 +542,20 @@ func (s *WebDAVServer) fetchDecrypted(fileID string) ([]byte, error) {
 				if rerr == nil && resp.StatusCode < 300 {
 					return data, nil
 				}
-				if rerr == nil {
-					log.Printf("[decryptor] %s: HTTP %d — falling back to API", fileID[:min(8, len(fileID))], resp.StatusCode)
+				// The decryptor daemon is reachable and authoritative for crypto.
+				// Do NOT fall back to the platform API on an HTTP error (e.g. a
+				// missing file, or a key the new account can't read) — the fallback
+				// re-fetches ciphertext with a potentially stale token and 401s.
+				if rerr == nil && resp.StatusCode == 404 {
+					return nil, os.ErrNotExist
 				}
-			} else {
-				log.Printf("[decryptor] unreachable (%v) — falling back to API", derr)
+				if rerr == nil {
+					log.Printf("[decryptor] %s: HTTP %d (no fallback)", fileID[:min(8, len(fileID))], resp.StatusCode)
+				}
+				return nil, fmt.Errorf("decryptor: HTTP %d", resp.StatusCode)
 			}
+			// Only fall back when the decryptor daemon is genuinely unreachable.
+			log.Printf("[decryptor] unreachable (%v) — falling back to API", derr)
 		}
 	}
 
